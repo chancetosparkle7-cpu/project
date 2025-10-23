@@ -415,7 +415,7 @@ with tabs[0]:
             sum_df = (
                 pd.DataFrame([{"category": k, "minutes": v} for k, v in by_cat.items()])
                 .sort_values("minutes", ascending=False)
-                .reset_index(drop_usecols=False)
+                .reset_index(drop_usecols=True)
             )
             sum_df["formatted"] = sum_df["minutes"].apply(lambda m: fmt_minutes(int(m)))
             st.dataframe(sum_df, use_container_width=True, hide_index=True)
@@ -573,4 +573,5 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.caption("💡 리마인더는 *앱이 열려 있을 때* 1분 간격으로 감지/발송됩니다. Slack 웹훅(SLACK_WEBHOOK_URL)을 설정하면 채널로도 알림을 보낼 수 있어요.")
+
 
