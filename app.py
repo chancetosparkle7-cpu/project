@@ -41,7 +41,7 @@ except Exception:
 APP_DIR = os.path.join(".", ".habit_tracker")
 TRACKS_CSV = os.path.join(APP_DIR, "tracks.csv")
 STATE_JSON  = os.path.join(APP_DIR, "running.json")         # running only (CSV 백엔드)
-GOALS_JSON  = os.path.join(APP_DIR, "goals.json")           # goals only (CSV 백엔드, 시간단위 float)
+GOALS_JSON  = os.path.join(APP_DIR, "goals.json")           # goals only (CSV 백엔드)
 CATEGORIES_JSON = os.path.join(APP_DIR, "categories.json")
 REMINDERS_CSV   = os.path.join(APP_DIR, "reminders.csv")
 
@@ -80,9 +80,7 @@ ensure_files()
 def now(): return datetime.now(KST)
 def iso(dt: datetime) -> str: return dt.astimezone(KST).isoformat(timespec="seconds")
 def parse_iso(s: str) -> datetime: return datetime.fromisoformat(s).astimezone(KST)
-def fmt_minutes(mins: int):
-    h, m = mins // 60, mins % 60
-    return f"{h}h {m}m" if h else f"{m}m"
+def fmt_minutes(mins: int): h, m = mins // 60, mins % 60; return f"{h}h {m}m" if h else f"{m}m"
 
 def to_kst_series(s: pd.Series) -> pd.Series:
     s = pd.to_datetime(s, errors="coerce")
@@ -228,6 +226,7 @@ def write_state(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def state_get(key: str, default=None):
+    # goals 등 K/V 저장용
     if use_supabase():
         data = _supabase.table("state").select("value").eq("key", key).limit(1).execute().data
         return json.loads(data[0]["value"]) if data else default
@@ -235,7 +234,7 @@ def state_get(key: str, default=None):
         conn = sqlite_init()
         row = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else default
-    # CSV 백엔드: 별도 goals.json 사용(시간단위 float)
+    # CSV 백엔드: 별도 goals.json 파일 사용
     path = GOALS_JSON if key == "goals" else STATE_JSON
     if not os.path.exists(path): return default
     try:
@@ -252,6 +251,7 @@ def state_set(key: str, value):
         conn.execute("INSERT OR REPLACE INTO state(key,value) VALUES(?,?)",
                      (key, json.dumps(value, ensure_ascii=False)))
         conn.commit(); return
+    # CSV 백엔드: 별도 goals.json 파일 사용
     path = GOALS_JSON if key == "goals" else STATE_JSON
     with open(path, "w", encoding="utf-8") as f:
         json.dump(value, f, ensure_ascii=False, indent=2)
@@ -475,32 +475,14 @@ def send_slack(title: str, body: str) -> bool:
         return False
 
 # =============================
-# 목표(주/월) 저장/불러오기 — 시간 단위(float) 저장
+# 목표(주/월) 저장/불러오기
 # =============================
 def load_goals():
-    # 내부 저장은 {"weekly": {cat: hours_float}, "monthly": {...}} 구조
     goals = state_get("goals", default={"weekly": {}, "monthly": {}})
     cats = load_categories()
     for c in cats:
-        goals["weekly"].setdefault(c, 0.0)   # 시간
-        goals["monthly"].setdefault(c, 0.0)  # 시간
-    # 구(분) → 신(시간) 마이그레이션 가능성 처리
-    # 값이 큰 정수(예: 600, 1200 등)면 분일 확률↑ → 시간으로 변환
-    def normalize(gmap: dict):
-        out = {}
-        for k, v in gmap.items():
-            try:
-                x = float(v)
-            except Exception:
-                x = 0.0
-            # 분 단위로 저장된 흔적(>=180 분=3h 이상)을 자동 변환
-            if x >= 180 and abs(round(x/60)*60 - x) < 1e-6:
-                out[k] = round(x/60.0, 2)
-            else:
-                out[k] = x
-        return out
-    goals["weekly"]  = normalize(goals.get("weekly", {}))
-    goals["monthly"] = normalize(goals.get("monthly", {}))
+        goals["weekly"].setdefault(c, 0)
+        goals["monthly"].setdefault(c, 0)
     return goals
 
 def save_goals(goals: dict):
@@ -545,7 +527,7 @@ def summarize(df: pd.DataFrame, start: datetime, end: datetime):
 # =============================
 def render_tracker_page():
     st.title("⏱️ 자기계발 시간 트래커")
-    st.caption("KST 기준 · CSV/SQLite/Supabase 영속 · 타이머/수동기록 · 최근 기록/요약 2분할 + 필터/편집/삭제 + 목표 게이지(시간 단위)")
+    st.caption("KST 기준 · CSV/SQLite/Supabase 영속 · 타이머/수동기록 · 최근 기록/요약 2분할 + 필터/편집/삭제 + 목표 게이지")
 
     if "running" not in st.session_state: st.session_state.running = read_state()
 
@@ -593,4 +575,311 @@ def render_tracker_page():
                 try:
                     end_dt = now(); start_dt = end_dt - timedelta(minutes=int(add_min))
                     append_track(start_dt, end_dt, add_cat, add_note)
-                    st.success(f"
+                    st.success(f"수동 입력 완료: [{add_cat}] {int(add_min)}분")
+                except Exception as e:
+                    st.error(f"입력 실패: {e}")
+
+    st.divider()
+
+    # --- 최근 기록 & 요약 (필터 + 편집/삭제 + 목표 게이지)
+    df_all = read_all_tracks_df()
+    st.subheader("🧭 최근 기록 & 🧾 요약")
+
+    # 1) 요약 기간 & 집계 단위
+    colA, colB, colC = st.columns([1.1, 1, 1])
+    with colA:
+        period = st.selectbox("요약 기간", ["오늘", "어제", "이번 주", "이번 달", "전체"], index=0, key="sum_period")
+    with colB:
+        agg_unit = st.selectbox("집계 단위(목표 비교)", ["주", "월"], index=0, key="agg_unit")
+    with colC:
+        page_size = st.selectbox("표시 개수", [20, 50, 100, 200], index=1)
+
+    start, end = daterange_start_end(period)
+
+    # 2) 최근 기록 필터바
+    st.markdown("##### 🔎 최근 기록 필터")
+    cats = load_categories()
+    fcol1, fcol2, fcol3 = st.columns([1, 2, 1])
+    with fcol1:
+        cat_filter = st.multiselect("카테고리", options=sorted(cats), default=[])
+    with fcol2:
+        memo_filter = st.text_input("메모 포함 검색", key="memo_filter")
+    with fcol3:
+        date_from = st.date_input("시작일(옵션)", value=None, key="f_date_from")
+        date_to   = st.date_input("종료일(옵션)", value=None, key="f_date_to")
+
+    df = df_all.copy()
+    if not df.empty:
+        # 기간 기본 필터(요약 기간)
+        df = df[(df["start"] >= pd.to_datetime(start.isoformat())) & (df["end"] <= pd.to_datetime(end.isoformat()))]
+        # 추가 날짜 필터
+        if date_from:
+            df = df[df["start"] >= pd.to_datetime(datetime.combine(date_from, datetime.min.time(), tzinfo=KST).isoformat())]
+        if date_to:
+            df = df[df["end"] <= pd.to_datetime(datetime.combine(date_to, datetime.max.time(), tzinfo=KST).isoformat())]
+        # 카테고리
+        if cat_filter:
+            df = df[df["category"].isin(cat_filter)]
+        # 메모
+        if memo_filter.strip():
+            df = df[df["note"].astype(str).str.contains(memo_filter, case=False, na=False)]
+
+    left, right = st.columns([1.4, 1.0], gap="large")
+
+    # 왼쪽: 최근 기록 + 편집/삭제
+    with left:
+        st.markdown("#### 📜 최근 기록")
+        if df.empty:
+            st.info("기록이 없습니다.")
+        else:
+            df_view = df.copy().sort_values("start", ascending=False).head(page_size)
+            df_view["시작(KST)"] = pd.to_datetime(df_view["start_iso"]).dt.tz_convert("Asia/Seoul")
+            df_view["종료(KST)"] = pd.to_datetime(df_view["end_iso"]).dt.tz_convert("Asia/Seoul")
+            df_view = df_view[["row_id","category","시작(KST)","종료(KST)","minutes","note"]]
+            df_view = df_view.rename(columns={
+                "row_id":"ID","category":"카테고리","minutes":"분","note":"메모"
+            })
+            st.dataframe(df_view, use_container_width=True, hide_index=True)
+
+            # 선택 & 편집/삭제 UI
+            st.markdown("##### ✏️ 편집 / 🗑 삭제")
+            options = []
+            for _, r in df_view.iterrows():
+                label = f"[{r['카테고리']}] {str(r['시작(KST)'])[:16]} · {int(r['분'])}분"
+                options.append((label, r["ID"]))
+            labels = [o[0] for o in options]; values = [o[1] for o in options]
+            sel_ids = st.multiselect("선택(여러 개 가능)", options=values, format_func=lambda v: labels[values.index(v)] if v in values else v)
+
+            e1, e2 = st.columns([1,1])
+            with e1:
+                if st.button("🗑 선택 삭제"):
+                    if sel_ids:
+                        n = delete_tracks(sel_ids)
+                        st.success(f"{n}건 삭제 완료"); st.experimental_rerun()
+                    else:
+                        st.info("선택 항목이 없습니다.")
+            with e2:
+                pass
+            # 단일 편집 폼
+            if len(sel_ids) == 1:
+                rid = sel_ids[0]
+                row = df_view[df_view["ID"] == rid].iloc[0]
+                with st.form("edit_form"):
+                    new_cat = st.selectbox("카테고리", options=sorted(load_categories()), index=sorted(load_categories()).index(row["카테고리"]) if row["카테고리"] in load_categories() else 0)
+                    new_min = st.number_input("분(1 이상)", min_value=1, step=5, value=int(row["분"]))
+                    new_note = st.text_input("메모", value=row["메모"] or "")
+                    submitted = st.form_submit_button("💾 저장")
+                    if submitted:
+                        ok = update_track(rid, new_cat, int(new_min), new_note)
+                        if ok: st.success("수정 완료"); st.experimental_rerun()
+                        else:  st.error("수정 실패(식별자 오류)")
+
+    # 오른쪽: 요약 + 목표 게이지
+    with right:
+        st.markdown("#### 🧾 요약(카테고리별 합계)")
+        if df_all.empty:
+            st.info("기록이 없습니다.")
+        else:
+            by_cat, total = summarize(df_all, start, end)
+            st.caption(f"{start.date()} ~ {(end - timedelta(seconds=1)).date()}")
+            if total == 0:
+                st.write("해당 기간 기록이 없습니다.")
+            else:
+                sum_df = (
+                    pd.DataFrame([{"카테고리": k, "분": v} for k, v in by_cat.items()])
+                    .sort_values("분", ascending=False)
+                    .reset_index(drop=True)
+                )
+                sum_df["표시"] = sum_df["분"].apply(lambda m: fmt_minutes(int(m)))
+                st.dataframe(sum_df, use_container_width=True, hide_index=True)
+                st.markdown(f"**합계: {fmt_minutes(total)} ({total}분)**")
+
+                # 목표 대비 진행률(게이지)
+                st.markdown("##### 🎯 목표 대비 진행률")
+                goals = load_goals()
+                goal_map = goals["weekly"] if agg_unit == "주" else goals["monthly"]
+
+                for _, r in sum_df.iterrows():
+                    cat = r["카테고리"]; val = int(r["분"])
+                    target = int(goal_map.get(cat, 0) or 0)
+                    pct = 1.0 if target <= 0 else min(1.0, val / target)
+                    st.write(f"- {cat}: {val}분 / 목표 {target}분")
+                    st.progress(pct, text=f"{int(pct*100)}%")
+
+                st.caption("※ 목표는 사이드바의 ‘🎯 목표 설정’에서 저장하세요. (주/월 단위)")
+
+# =============================
+# 페이지: 리마인더
+# =============================
+def render_reminder_page():
+    st.title("🔔 일정 리마인더")
+    st.caption("사전 알림 · 반복 · Slack 연동")
+
+    st.markdown("### 리마인더 추가")
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        r_title = st.text_input("제목", placeholder="예: 오늘 독서 30분", key="reminder_title")
+        r_cat = st.selectbox("관련 카테고리(옵션)", options=["(없음)"] + sorted(load_categories()))
+        r_note = st.text_input("메모(옵션)", "", key="reminder_note")
+    with rc2:
+        today = now()
+        r_date = st.date_input("기한 날짜", value=today.date(), key="rem_date")
+        r_time = st.time_input("기한 시각", value=today.replace(second=0, microsecond=0).time(), key="rem_time")
+        r_adv  = st.number_input("사전 알림(분)", min_value=0, step=5, value=10, key="rem_adv")
+        r_rep  = st.selectbox("반복", REPEAT_CHOICES, index=0, key="rem_repeat")
+
+    if st.button("➕ 리마인더 생성", key="rem_add_btn"):
+        if not r_title.strip():
+            st.error("제목은 필수입니다.")
+        else:
+            due_dt = datetime.combine(r_date, r_time).replace(tzinfo=KST)
+            add_reminder(
+                title=r_title.strip(),
+                category=(None if r_cat == "(없음)" else r_cat),
+                note=r_note.strip(),
+                due_dt=due_dt,
+                advance_minutes=int(r_adv),
+                repeat=r_rep,
+                active=True
+            )
+            st.success("리마인더가 추가되었습니다.")
+
+    st.divider()
+    st.markdown("### 리마인더 목록")
+    rem_df = load_reminders_df()
+    if rem_df.empty:
+        st.info("리마인더가 없습니다.")
+    else:
+        view = rem_df.copy()
+        view["due_local"] = to_kst_series(view["due_iso"])
+        view["last_fired_local"] = to_kst_series(view["last_fired_iso"])
+        view = view[[
+            "id","active","title","category","note",
+            "due_local","advance_minutes","repeat","last_fired_local"
+        ]].sort_values(["active","due_local"], ascending=[False, True])
+        view = view.rename(columns={
+            "id":"ID","active":"활성","title":"제목","category":"카테고리","note":"메모",
+            "due_local":"기한(KST)","advance_minutes":"사전알림(분)","repeat":"반복","last_fired_local":"마지막 발송(KST)"
+        })
+        st.dataframe(view, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 선택 항목 관리")
+        sel = st.multiselect("리마인더 선택(ID)", options=view["ID"].tolist(), key="rem_select")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("선택 비활성화", key="rem_disable"):
+                if sel:
+                    rem_df.loc[rem_df["id"].isin(sel), "active"] = False
+                    save_reminders_df(rem_df); st.success("비활성화 완료")
+                else:
+                    st.info("선택된 항목이 없습니다.")
+        with c2:
+            if st.button("선택 삭제", key="rem_delete"):
+                if sel:
+                    rem_df = rem_df[~rem_df["id"].isin(sel)]
+                    save_reminders_df(rem_df); st.success("삭제 완료")
+                else:
+                    st.info("선택된 항목이 없습니다.")
+        with c3:
+            if st.button("선택 즉시 발송(테스트)", key="rem_test_send"):
+                now_dt = now(); fired = 0
+                for rid in sel:
+                    row = rem_df.loc[rem_df["id"] == rid].iloc[0].to_dict()
+                    title = row["title"]; due = row["due_iso"]
+                    body = f"기한: {due}\n메모: {row.get('note','')}"
+                    st.toast(f"🔔 {title}\n{body}")
+                    if send_slack(f"[테스트] {title}", body): st.info(f"Slack 전송: {title}")
+                    rem_df = mark_fired(rem_df, rid, now_dt); fired += 1
+                if fired:
+                    save_reminders_df(rem_df); st.success(f"{fired}건 처리")
+
+# -----------------------------
+# 사이드바: 네비 + (위) 목표 설정 → (아래) 설정/데이터 & 백업
+# -----------------------------
+st.sidebar.markdown("## 📂 페이지")
+PAGE_TRACKER = "자기계발 시간 트래커"
+PAGE_REMINDER = "일정 리마인더"
+page = st.sidebar.radio("이동", [PAGE_TRACKER, PAGE_REMINDER], index=0, key="nav_page")
+
+# --- 목표 설정 (상단)
+st.sidebar.header("🎯 목표 설정")
+goals = load_goals()
+t1, t2 = st.sidebar.tabs(["주간 목표(분)", "월간 목표(분)"])
+with t1:
+    new_weekly = {}
+    for c in sorted(load_categories()):
+        new_weekly[c] = st.number_input(f"{c}", min_value=0, step=10, value=int(goals["weekly"].get(c, 0) or 0), key=f"goal_w_{c}")
+    if st.button("주간 목표 저장"):
+        goals["weekly"] = new_weekly; save_goals(goals); st.sidebar.success("주간 목표 저장 완료")
+with t2:
+    new_monthly = {}
+    for c in sorted(load_categories()):
+        new_monthly[c] = st.number_input(f"{c}", min_value=0, step=10, value=int(goals["monthly"].get(c, 0) or 0), key=f"goal_m_{c}")
+    if st.button("월간 목표 저장"):
+        goals["monthly"] = new_monthly; save_goals(goals); st.sidebar.success("월간 목표 저장 완료")
+
+st.sidebar.divider()
+
+# --- 설정/데이터 & 데이터 백업 (하단)
+st.sidebar.title("⚙️ 설정 / 데이터")
+st.sidebar.caption(f"저장소: **{BACKEND.upper()}**")
+
+cats = load_categories()
+with st.sidebar:
+    st.header("카테고리")
+    st.write(", ".join(sorted(cats)) if cats else "(없음)")
+    with st.form("cat_form", clear_on_submit=True):
+        new_cat = st.text_input("카테고리 추가", "", key="cat_add")
+        rm_cat = st.multiselect("카테고리 삭제", options=sorted(cats), key="cat_rm")
+        submitted_cat = st.form_submit_button("저장")
+        if submitted_cat:
+            changed = False
+            if new_cat and new_cat not in cats:
+                cats.append(new_cat); changed = True
+            for c in rm_cat:
+                if c in cats:
+                    cats.remove(c); changed = True
+            if changed:
+                save_categories(cats); st.success("카테고리 업데이트 완료")
+            else:
+                st.info("변경사항이 없습니다.")
+    if st.button("🔤 카테고리 한글로 통일"):
+        migrate_categories_to_korean(); st.success("카테고리/기록을 한글로 변환했습니다!")
+
+    st.divider()
+    st.header("📦 데이터 백업 (CSV)")
+    if os.path.exists(TRACKS_CSV):
+        with open(TRACKS_CSV, "rb") as f:
+            st.download_button("CSV 내보내기(트래킹)", f, file_name="tracks.csv", mime="text/csv")
+    if os.path.exists(REMINDERS_CSV):
+        with open(REMINDERS_CSV, "rb") as f:
+            st.download_button("CSV 내보내기(리마인더)", f, file_name="reminders.csv", mime="text/csv")
+
+# 라우팅
+if page == PAGE_TRACKER:
+    render_tracker_page()
+else:
+    render_reminder_page()
+
+# =============================
+# 리마인더 감지 & 자동 새로고침
+# =============================
+def scan_and_fire():
+    rem_df = load_reminders_df()
+    if rem_df.empty: return
+    now_dt = now(); fired_any = False
+    for _, row in rem_df.iterrows():
+        rowd = row.to_dict()
+        if should_fire(rowd, now_dt):
+            title = rowd["title"]; due = rowd["due_iso"]
+            adv = int(rowd.get("advance_minutes", 0))
+            when = "마감 임박" if now_dt < due else "마감 도래"
+            body = f"{when} · 기한: {due}\n사전알림: {adv}분\n메모: {rowd.get('note','')}"
+            st.toast(f"🔔 {title}\n{body}")
+            if send_slack(title, body): st.info(f"Slack 전송: {title}")
+            rem_df = mark_fired(rem_df, rowd["id"], now_dt); fired_any = True
+    if fired_any: save_reminders_df(rem_df)
+
+scan_and_fire()
+st.markdown("<script>setTimeout(() => window.location.reload(), 60*1000);</script>", unsafe_allow_html=True)
+st.caption("💡 리마인더는 *앱이 열려 있을 때* 1분 간격으로 감지/발송됩니다. 저장소는 CSV/SQLite/Supabase 중 선택 가능해요.")
