@@ -6,7 +6,7 @@ import csv
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
+from calendar import monthrange
 
 import pandas as pd
 import streamlit as st
@@ -27,6 +27,7 @@ STATE_JSON = os.path.join(APP_DIR, "running.json")
 CATEGORIES_JSON = os.path.join(APP_DIR, "categories.json")
 REMINDERS_CSV = os.path.join(APP_DIR, "reminders.csv")
 
+# ✅ 한글 기본 카테고리
 DEFAULT_CATEGORIES = ["공부", "운동", "독서", "글쓰기", "외국어", "명상"]
 KST = timezone(timedelta(hours=9))
 
@@ -138,10 +139,12 @@ def daterange_start_end(kind: str):
         end = start + timedelta(days=7)
     elif kind == "이번 달":
         start = now_kst.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        if start.month == 12:
-            end = start.replace(year=start.year+1, month=1)
+        # 다음달 1일 계산
+        y, m = start.year, start.month
+        if m == 12:
+            end = start.replace(year=y+1, month=1)
         else:
-            end = start.replace(month=start.month+1)
+            end = start.replace(month=m+1)
     elif kind == "전체":
         start = datetime(1970,1,1,tzinfo=KST)
         end = datetime(2999,1,1,tzinfo=KST)
@@ -183,7 +186,6 @@ def load_reminders_df() -> pd.DataFrame:
     return df
 
 def save_reminders_df(df: pd.DataFrame):
-    # 문자열/ISO 저장
     out = df.copy()
     if "due_iso" in out.columns:
         out["due_iso"] = out["due_iso"].apply(lambda x: x.isoformat() if pd.notna(x) else "")
@@ -191,7 +193,7 @@ def save_reminders_df(df: pd.DataFrame):
         out["last_fired_iso"] = out["last_fired_iso"].apply(lambda x: x.isoformat() if pd.notna(x) else "")
     out.to_csv(REMINDERS_CSV, index=False, encoding="utf-8")
 
-def add_reminder(title: str, category: str, note: str, due_dt: datetime,
+def add_reminder(title: str, category: str | None, note: str, due_dt: datetime,
                  advance_minutes: int = 0, repeat: str = "없음", active: bool = True):
     df = load_reminders_df()
     rid = str(uuid.uuid4())
@@ -218,14 +220,14 @@ def compute_next_due(due_dt: datetime, repeat: str) -> datetime | None:
     if repeat == "매주":
         return due_dt + timedelta(weeks=1)
     if repeat == "매월":
-        # 간단 월가산(말일 이슈는 같은 일자가 없으면 말일로 고정)
+        # 말일 안전 처리
         y, m = due_dt.year, due_dt.month
         if m == 12:
             ny, nm = y + 1, 1
         else:
             ny, nm = y, m + 1
-        # 같은 날짜 유지, 불가능하면 말일
-        day = min(due_dt.day, [31,29,31,30,31,30,31,31,30,31,30,31][nm-1])
+        last_day = monthrange(ny, nm)[1]
+        day = min(due_dt.day, last_day)
         return due_dt.replace(year=ny, month=nm, day=day)
     return None
 
@@ -237,11 +239,10 @@ def should_fire(row, now_dt: datetime):
         return False
     adv = int(row.get("advance_minutes", 0))
     window_start = due - timedelta(minutes=adv)
-    # 이미 같은 "기한"에 대해 발송했는지 체크
     last = row.get("last_fired_iso", pd.NaT)
-    if pd.notna(last) and last >= window_start and last <= due + timedelta(minutes=5):
+    # 같은 due에 대해 이미 발송했으면 스킵
+    if pd.notna(last) and (window_start <= last <= due + timedelta(minutes=5)):
         return False
-    # 현재 시각이 사전알림시각 이상이면 발송
     return now_dt >= window_start
 
 def mark_fired(df: pd.DataFrame, rid: str, fired_dt: datetime):
@@ -250,13 +251,11 @@ def mark_fired(df: pd.DataFrame, rid: str, fired_dt: datetime):
         return df
     i = idx[0]
     df.at[i, "last_fired_iso"] = pd.to_datetime(fired_dt.isoformat())
-    # 반복인 경우 다음 기한으로 이동
     repeat = df.at[i, "repeat"]
     due = df.at[i, "due_iso"]
     if pd.notna(due):
         nxt = compute_next_due(due.to_pydatetime().astimezone(KST), repeat)
         if nxt is None:
-            # 단발성 → 비활성화
             df.at[i, "active"] = False
         else:
             df.at[i, "due_iso"] = pd.to_datetime(nxt.isoformat())
@@ -271,7 +270,7 @@ def send_slack(title: str, body: str) -> bool:
     try:
         payload = {"text": f":alarm_clock: *{title}*\n{body}"}
         r = requests.post(url, json=payload, timeout=5)
-        return r.status_code >= 200 and r.status_code < 300
+        return 200 <= r.status_code < 300
     except Exception:
         return False
 
@@ -279,11 +278,6 @@ def send_slack(title: str, body: str) -> bool:
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="자기계발 트래커 + 리마인더", page_icon="⏱️", layout="wide")
-
-# 1분마다 자동 새로고침(열려 있는 동안 리마인더 감지)
-st_autorefresh = st.rerun  # Streamlit 최신 버전 대응
-st.experimental_set_query_params()      # (빈 호출로 초기화)
-st_autorefresh_token = st.experimental_data_editor if False else None  # no-op, 키 충돌 방지용
 
 st.sidebar.title("⚙️ 설정 / 데이터")
 cats = load_categories()
@@ -378,7 +372,7 @@ with col1:
                     st.error(f"기록 실패: {e}")
         else:
             cats = load_categories()
-            start_cat = st.selectbox("카테고리", options=sorted(cats) if cats else ["study"])
+            start_cat = st.selectbox("카테고리", options=sorted(cats) if cats else ["공부"])
             start_note = st.text_input("메모(옵션)", "")
             if st.button("▶️ 세션 시작"):
                 state = {"category": start_cat, "start_iso": iso(now()), "note": start_note}
@@ -389,7 +383,7 @@ with col2:
     st.subheader("수동 입력(분 단위)")
     with st.container(border=True):
         cats = load_categories()
-        add_cat = st.selectbox("카테고리 선택", options=sorted(cats) if cats else ["study"], key="add_cat")
+        add_cat = st.selectbox("카테고리 선택", options=sorted(cats) if cats else ["공부"], key="add_cat")
         add_min = st.number_input("분(1 이상)", min_value=1, step=5, value=30)
         add_note = st.text_input("메모", "")
         if st.button("➕ 기록 추가"):
@@ -421,7 +415,7 @@ with tabs[0]:
             sum_df = (
                 pd.DataFrame([{"category": k, "minutes": v} for k, v in by_cat.items()])
                 .sort_values("minutes", ascending=False)
-                .reset_index(drop=True)
+                .reset_index(drop_usecols=False)
             )
             sum_df["formatted"] = sum_df["minutes"].apply(lambda m: fmt_minutes(int(m)))
             st.dataframe(sum_df, use_container_width=True, hide_index=True)
@@ -452,9 +446,7 @@ with tabs[2]:
         daily_sum = daily.groupby("date")["minutes"].sum().reset_index()
         fig2, ax2 = plt.subplots()
         ax2.bar(daily_sum["date"].astype(str), daily_sum["minutes"])
-        ax2.set_xlabel("날짜")
-        ax2.set_ylabel("분")
-        ax2.set_title("일별 총합(분)")
+        ax2.set_xlabel("날짜"); ax2.set_ylabel("분"); ax2.set_title("일별 총합(분)")
         plt.xticks(rotation=45, ha="right")
         st.pyplot(fig2)
 
@@ -463,9 +455,7 @@ with tabs[2]:
         pivot = cat_daily.pivot(index="date", columns="category", values="minutes").fillna(0)
         fig3, ax3 = plt.subplots()
         pivot.plot(ax=ax3)
-        ax3.set_xlabel("날짜")
-        ax3.set_ylabel("분")
-        ax3.set_title("카테고리별 일별 분")
+        ax3.set_xlabel("날짜"); ax3.set_ylabel("분"); ax3.set_title("카테고리별 일별 분")
         plt.xticks(rotation=45, ha="right")
         st.pyplot(fig3)
 
@@ -509,7 +499,6 @@ with tabs[3]:
     if rem_df.empty:
         st.info("리마인더가 없습니다.")
     else:
-        # 보기 편의 컬럼
         view = rem_df.copy()
         view["due_local"] = view["due_iso"].dt.tz_convert("Asia/Seoul")
         view["last_fired_local"] = view["last_fired_iso"].dt.tz_convert("Asia/Seoul")
@@ -519,7 +508,6 @@ with tabs[3]:
         ]].sort_values(["active","due_local"], ascending=[False, True])
         st.dataframe(view, use_container_width=True, hide_index=True)
 
-        # 선택 삭제/비활성화
         st.markdown("#### 선택 항목 관리")
         sel = st.multiselect("리마인더 선택(ID)", options=view["id"].tolist())
         c1, c2, c3 = st.columns(3)
@@ -554,7 +542,7 @@ with tabs[3]:
                     save_reminders_df(rem_df); st.success(f"{fired}건 처리")
 
 # -----------------------------
-# 주기적 감지(페이지 실행 시마다 수행)
+# 리마인더 감지 & 자동 새로고침
 # -----------------------------
 def scan_and_fire():
     rem_df = load_reminders_df()
@@ -578,11 +566,10 @@ def scan_and_fire():
     if fired_any:
         save_reminders_df(rem_df)
 
-# 스캔 실행 & 1분마다 자동 갱신(앱이 열려 있을 때만 동작)
+# 실행 시마다 스캔 + JS로 1분마다 새로고침
 scan_and_fire()
 st.markdown(
     "<script>setTimeout(() => window.location.reload(), 60*1000);</script>",
     unsafe_allow_html=True
 )
-st.caption("💡 리마인더는 **앱이 열려 있을 때** 1분 간격으로 감지/발송됩니다. Slack 웹훅을 설정하면 앱이 열려 있어도 Slack으로 알림을 받을 수 있습니다.")
-
+st.caption("💡 리마인더는 *앱이 열려 있을 때* 1분 간격으로 감지/발송됩니다. Slack 웹훅(SLACK_WEBHOOK_URL)을 설정하면 채널로도 알림을 보낼 수 있어요.")
