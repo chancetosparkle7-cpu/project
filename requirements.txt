@@ -3,3 +3,15 @@ pandas>=2.0
 matplotlib>=3.7
 requests>=2.31
 
+# 영속화
+supabase>=2.4.0
+psycopg2-binary>=2.9
+
+# Google Calendar (Service Account)
+google-api-python-client>=2.140.0
+google-auth>=2.33.0
+google-auth-oauthlib>=1.2.1
+
+# ICS 대안용(ICS URL을 쓸 때만 실사용)
+ics>=0.7
+pytz>=2024.1
