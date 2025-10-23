@@ -25,7 +25,7 @@ try:
 except Exception:
     SupabaseClient = None
 
-# Google Calendar (Service Account)
+# Google Calendar (Service Account) - 이번 본문에서는 목록 표시 제거. 필요 시 fetch만 활용 가능.
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -77,6 +77,19 @@ def now(): return datetime.now(KST)
 def iso(dt: datetime) -> str: return dt.astimezone(KST).isoformat(timespec="seconds")
 def parse_iso(s: str) -> datetime: return datetime.fromisoformat(s).astimezone(KST)
 def fmt_minutes(mins: int): h,m=mins//60, mins%60; return f"{h}h {m}m" if h else f"{m}m"
+
+def to_kst_series(s: pd.Series) -> pd.Series:
+    """
+    Datetime Series를 KST로 안전 변환.
+    - tz-naive: KST로 localize
+    - tz-aware: KST로 convert
+    - NaT/빈값은 그대로 유지
+    """
+    s = pd.to_datetime(s, errors="coerce")
+    if getattr(s.dtype, "tz", None) is None:
+        return s.dt.tz_localize("Asia/Seoul", nonexistent="NaT", ambiguous="NaT")
+    else:
+        return s.dt.tz_convert("Asia/Seoul")
 
 # =============================
 # STORAGE LAYER (csv / sqlite / supabase)
@@ -375,59 +388,9 @@ def send_slack(title: str, body: str) -> bool:
     except Exception:
         return False
 
-# =============================
-# Google Calendar
-# =============================
+# (선택) 캘린더 가져오기 함수는 남겨두되 화면 표시는 제거
 def fetch_calendar_events(start_dt: datetime, end_dt: datetime) -> list[dict]:
-    events = []
-    ics_url = st.secrets.get("GOOGLE_CALENDAR_ICS_URL")
-    svc_json = st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    cal_id = st.secrets.get("GOOGLE_CALENDAR_ID")
-
-    if svc_json and cal_id and service_account and build:
-        try:
-            info = json.loads(svc_json)
-            creds = service_account.Credentials.from_service_account_info(
-                info, scopes=["https://www.googleapis.com/auth/calendar.readonly"]
-            )
-            service = build("calendar", "v3", credentials=creds, cache_discovery=False)
-            time_min = start_dt.astimezone(timezone.utc).isoformat()
-            time_max = end_dt.astimezone(timezone.utc).isoformat()
-            resp = service.events().list(
-                calendarId=cal_id, timeMin=time_min, timeMax=time_max,
-                singleEvents=True, orderBy="startTime"
-            ).execute()
-            for ev in resp.get("items", []):
-                start = ev["start"].get("dateTime") or ev["start"].get("date")
-                end = ev["end"].get("dateTime") or ev["end"].get("date")
-                events.append({
-                    "id": ev.get("id"),
-                    "summary": ev.get("summary","(제목 없음)"),
-                    "start": start, "end": end,
-                    "location": ev.get("location",""),
-                    "htmlLink": ev.get("htmlLink","")
-                })
-            return events
-        except Exception as e:
-            st.warning(f"Google API 조회 실패: {e}")
-
-    if ics_url:
-        try:
-            import ics, pytz  # requirements.txt에 명시
-            r = requests.get(ics_url, timeout=10)
-            c = ics.Calendar(r.text)
-            for ev in c.events:
-                if ev.begin is None: continue
-                b = ev.begin.astimezone(); e = ev.end.astimezone()
-                if e < start_dt or b > end_dt: continue
-                events.append({
-                    "id": ev.uid, "summary": ev.name or "(제목 없음)",
-                    "start": b.isoformat(), "end": e.isoformat(),
-                    "location": getattr(ev, "location", "") or "", "htmlLink": ""
-                })
-        except Exception as e:
-            st.warning(f"ICS 조회 실패: {e}")
-    return events
+    return []  # 현재는 사용하지 않음 (화면에서 Google Calendar 목록 제거)
 
 # =============================
 # 페이지 구성
@@ -635,7 +598,7 @@ def render_tracker_page():
 
 def render_reminder_page():
     st.title("🔔 일정 리마인더")
-    st.caption("사전 알림 · 반복 · Slack 연동 · Google Calendar 읽기")
+    st.caption("사전 알림 · 반복 · Slack 연동")
 
     st.markdown("### 리마인더 추가")
     rc1, rc2 = st.columns(2)
@@ -667,26 +630,14 @@ def render_reminder_page():
             st.success("리마인더가 추가되었습니다.")
 
     st.divider()
-    st.markdown("### Google Calendar 일정 (오늘~+14일)")
-    gc_start = now().replace(hour=0, minute=0, second=0, microsecond=0)
-    gc_end = gc_start + timedelta(days=14)
-    events = fetch_calendar_events(gc_start, gc_end)
-    if not events:
-        st.info("표시할 일정이 없습니다. (Service Account 공유 또는 ICS URL을 확인하세요)")
-    else:
-        ev_df = pd.DataFrame(events)
-        st.dataframe(ev_df[["summary","start","end","location","htmlLink"]],
-                     use_container_width=True, hide_index=True)
-
-    st.divider()
     st.markdown("### 리마인더 목록")
     rem_df = load_reminders_df()
     if rem_df.empty:
         st.info("리마인더가 없습니다.")
     else:
         view = rem_df.copy()
-        view["due_local"] = view["due_iso"].dt.tz_convert("Asia/Seoul")
-        view["last_fired_local"] = view["last_fired_iso"].dt.tz_convert("Asia/Seoul")
+        view["due_local"] = to_kst_series(view["due_iso"])
+        view["last_fired_local"] = to_kst_series(view["last_fired_iso"])
         view = view[[
             "id","active","title","category","note",
             "due_local","advance_minutes","repeat","last_fired_local"
@@ -726,6 +677,7 @@ def render_reminder_page():
 # =============================
 # 라우팅
 # =============================
+st.set_page_config(page_title="자기계발 트래커 / 일정 리마인더", page_icon="⏱️", layout="wide")
 if page == PAGE_TRACKER:
     render_tracker_page()
 elif page == PAGE_REMINDER:
@@ -752,4 +704,4 @@ def scan_and_fire():
 
 scan_and_fire()
 st.markdown("<script>setTimeout(() => window.location.reload(), 60*1000);</script>", unsafe_allow_html=True)
-st.caption("💡 리마인더는 *앱이 열려 있을 때* 1분 간격으로 감지/발송됩니다. 저장소는 CSV/SQLite/Supabase 중 선택, 캘린더는 Service Account 또는 공개 ICS를 사용할 수 있어요.")
+st.caption("💡 리마인더는 *앱이 열려 있을 때* 1분 간격으로 감지/발송됩니다. 저장소는 CSV/SQLite/Supabase 중 선택 가능해요.")
