@@ -373,7 +373,7 @@ with col1:
         else:
             cats = load_categories()
             start_cat = st.selectbox("카테고리", options=sorted(cats) if cats else ["공부"])
-            start_note = st.text_input("메모(옵션)", "")
+            start_note = st.text_input("메모(옵션)", "", key="start_note")
             if st.button("▶️ 세션 시작"):
                 state = {"category": start_cat, "start_iso": iso(now()), "note": start_note}
                 write_state(state); st.session_state.running = state
@@ -385,7 +385,7 @@ with col2:
         cats = load_categories()
         add_cat = st.selectbox("카테고리 선택", options=sorted(cats) if cats else ["공부"], key="add_cat")
         add_min = st.number_input("분(1 이상)", min_value=1, step=5, value=30)
-        add_note = st.text_input("메모", "")
+        add_note = st.text_input("메모", "", key="add_note")
         if st.button("➕ 기록 추가"):
             try:
                 end_dt = now()
@@ -466,9 +466,9 @@ with tabs[3]:
     st.markdown("### 리마인더 추가")
     rc1, rc2 = st.columns(2)
     with rc1:
-        r_title = st.text_input("제목", placeholder="예: 오늘 독서 30분")
+        r_title = st.text_input("제목", placeholder="예: 오늘 독서 30분", key="reminder_title")
         r_cat = st.selectbox("관련 카테고리(옵션)", options=["(없음)"] + sorted(load_categories()))
-        r_note = st.text_input("메모(옵션)")
+        r_note  = st.text_input("메모(옵션)", "", key="reminder_note")
     with rc2:
         today = now()
         r_date = st.date_input("기한 날짜", value=today.date())
@@ -573,3 +573,4 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.caption("💡 리마인더는 *앱이 열려 있을 때* 1분 간격으로 감지/발송됩니다. Slack 웹훅(SLACK_WEBHOOK_URL)을 설정하면 채널로도 알림을 보낼 수 있어요.")
+
