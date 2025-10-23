@@ -13,6 +13,9 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
+# 페이지 설정 (한 번만 호출)
+st.set_page_config(page_title="자기계발 트래커 / 일정 리마인더", page_icon="⏱️", layout="wide")
+
 # Optional deps
 try:
     import requests
@@ -25,7 +28,7 @@ try:
 except Exception:
     SupabaseClient = None
 
-# Google Calendar (Service Account) - 이번 본문에서는 목록 표시 제거. 필요 시 fetch만 활용 가능.
+# (참고) 구글 캘린더 API는 화면 표시는 제거했지만 함수를 남겨둘 수 있어 import만 유지
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -36,7 +39,7 @@ except Exception:
 # =============================
 # 경로 & 상수
 # =============================
-APP_DIR = os.path.join(".", ".habit_tracker")  # 리포 루트 기준
+APP_DIR = os.path.join(".", ".habit_tracker")
 TRACKS_CSV = os.path.join(APP_DIR, "tracks.csv")
 STATE_JSON = os.path.join(APP_DIR, "running.json")
 CATEGORIES_JSON = os.path.join(APP_DIR, "categories.json")
@@ -76,7 +79,7 @@ ensure_files()
 def now(): return datetime.now(KST)
 def iso(dt: datetime) -> str: return dt.astimezone(KST).isoformat(timespec="seconds")
 def parse_iso(s: str) -> datetime: return datetime.fromisoformat(s).astimezone(KST)
-def fmt_minutes(mins: int): h,m=mins//60, mins%60; return f"{h}h {m}m" if h else f"{m}m"
+def fmt_minutes(mins: int): h, m = mins // 60, mins % 60; return f"{h}h {m}m" if h else f"{m}m"
 
 def to_kst_series(s: pd.Series) -> pd.Series:
     """
@@ -129,9 +132,11 @@ def sqlite_init():
 # --- Supabase
 SUPABASE_URL = st.secrets.get("SUPABASE_URL")
 SUPABASE_KEY = st.secrets.get("SUPABASE_SERVICE_KEY") or st.secrets.get("SUPABASE_ANON_KEY")
-_supabase: SupabaseClient | None = None
-if BACKEND == "supabase" and SUPABASE_URL and SUPABASE_KEY and SupabaseClient:
-    _supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+try:
+    _supabase: SupabaseClient | None = create_client(SUPABASE_URL, SUPABASE_KEY) \
+        if BACKEND == "supabase" and SUPABASE_URL and SUPABASE_KEY and SupabaseClient else None
+except Exception:
+    _supabase = None
 
 def use_csv(): return BACKEND == "csv" or BACKEND not in ("sqlite", "supabase")
 def use_sqlite(): return BACKEND == "sqlite"
@@ -388,55 +393,9 @@ def send_slack(title: str, body: str) -> bool:
     except Exception:
         return False
 
-# (선택) 캘린더 가져오기 함수는 남겨두되 화면 표시는 제거
+# (화면에서는 사용하지 않음)
 def fetch_calendar_events(start_dt: datetime, end_dt: datetime) -> list[dict]:
-    return []  # 현재는 사용하지 않음 (화면에서 Google Calendar 목록 제거)
-
-# =============================
-# 페이지 구성
-# =============================
-st.set_page_config(page_title="자기계발 트래커 / 일정 리마인더", page_icon="⏱️", layout="wide")
-
-# --- 왼쪽 네비게이션
-st.sidebar.markdown("## 📂 페이지")
-PAGE_TRACKER = "자기계발 시간 트래커"
-PAGE_REMINDER = "일정 리마인더"
-page = st.sidebar.radio("이동", [PAGE_TRACKER, PAGE_REMINDER], index=0, key="nav_page")
-
-# --- 공용: 설정/데이터(사이드바)
-st.sidebar.title("⚙️ 설정 / 데이터")
-st.sidebar.caption(f"저장소: **{BACKEND.upper()}**")
-
-cats = load_categories()
-with st.sidebar:
-    st.header("카테고리")
-    st.write(", ".join(sorted(cats)) if cats else "(없음)")
-    with st.form("cat_form", clear_on_submit=True):
-        new_cat = st.text_input("카테고리 추가", "", key="cat_add")
-        rm_cat = st.multiselect("카테고리 삭제", options=sorted(cats), key="cat_rm")
-        submitted_cat = st.form_submit_button("저장")
-        if submitted_cat:
-            changed = False
-            if new_cat and new_cat not in cats:
-                cats.append(new_cat); changed = True
-            for c in rm_cat:
-                if c in cats:
-                    cats.remove(c); changed = True
-            if changed:
-                save_categories(cats); st.success("카테고리 업데이트 완료")
-            else:
-                st.info("변경사항이 없습니다.")
-    if st.button("🔤 카테고리 한글로 통일"):
-        migrate_categories_to_korean(); st.success("카테고리/기록을 한글로 변환했습니다!")
-
-    st.divider()
-    st.header("데이터 백업 (CSV)")
-    if os.path.exists(TRACKS_CSV):
-        with open(TRACKS_CSV, "rb") as f:
-            st.download_button("CSV 내보내기(트래킹)", f, file_name="tracks.csv", mime="text/csv")
-    if os.path.exists(REMINDERS_CSV):
-        with open(REMINDERS_CSV, "rb") as f:
-            st.download_button("CSV 내보내기(리마인더)", f, file_name="reminders.csv", mime="text/csv")
+    return []
 
 # =============================
 # 공통 함수(기간, 요약)
@@ -473,7 +432,7 @@ def summarize(df: pd.DataFrame, start: datetime, end: datetime):
     return by_cat, total
 
 # =============================
-# 페이지별 렌더러
+# 페이지
 # =============================
 def render_tracker_page():
     st.title("⏱️ 자기계발 시간 트래커")
@@ -483,6 +442,7 @@ def render_tracker_page():
 
     col1, col2 = st.columns([2, 3], gap="large")
 
+    # --- 실시간 타이머
     with col1:
         st.subheader("실시간 타이머")
         with st.container(border=True):
@@ -511,6 +471,7 @@ def render_tracker_page():
                     write_state(state); st.session_state.running = state
                     st.success(f"세션 시작: [{start_cat}] {state['start_iso']}")
 
+    # --- 수동 입력
     with col2:
         st.subheader("수동 입력(분 단위)")
         with st.container(border=True):
@@ -528,7 +489,7 @@ def render_tracker_page():
 
     st.divider()
 
-    # --- 요약 & 차트: 2단
+    # --- 요약 & 차트: 2단 (원형/막대 + 일별 누적/그룹형)
     df = read_all_tracks_df()
     st.subheader("📊 요약 & 📈 차트")
     period = st.selectbox("기간", ["오늘", "어제", "이번 주", "이번 달", "전체"], index=0, key="sum_period")
@@ -536,15 +497,18 @@ def render_tracker_page():
 
     left, right = st.columns([1, 1], gap="large")
 
+    # ---------- 요약 ----------
     with left:
         st.markdown("#### 요약")
         if df.empty:
             st.info("아직 기록이 없습니다.")
+            sum_df = pd.DataFrame(columns=["category", "minutes", "formatted"])
         else:
             by_cat, total = summarize(df, start, end)
             st.caption(f"{start.date()} ~ {(end - timedelta(seconds=1)).date()}")
             if total == 0:
                 st.write("해당 기간 기록이 없습니다.")
+                sum_df = pd.DataFrame(columns=["category", "minutes", "formatted"])
             else:
                 sum_df = (
                     pd.DataFrame([{"category": k, "minutes": v} for k, v in by_cat.items()])
@@ -553,41 +517,118 @@ def render_tracker_page():
                 )
                 sum_df["formatted"] = sum_df["minutes"].apply(lambda m: fmt_minutes(int(m)))
                 st.dataframe(sum_df, use_container_width=True, hide_index=True)
+                st.markdown(f"**합계: {fmt_minutes(total)} ({total}분)**")
 
+    # ---------- 차트 ----------
+    with right:
+        st.markdown("#### 차트")
+
+        if df.empty or sum_df.empty:
+            st.info("차트를 표시할 데이터가 없습니다.")
+        else:
+            # 기간 내로 클립된 데이터(분) 계산
+            s, e = pd.to_datetime(start.isoformat()), pd.to_datetime(end.isoformat())
+            clip_df = df.copy()
+            clip_df["overlap_start"] = clip_df["start"].clip(lower=s)
+            clip_df["overlap_end"] = clip_df["end"].clip(upper=e)
+            clip_df["minutes_clip"] = (
+                (clip_df["overlap_end"] - clip_df["overlap_start"]).dt.total_seconds() / 60
+            ).clip(lower=0).round().astype(int)
+            clip_df["date"] = (
+                pd.to_datetime(clip_df["overlap_start"]).dt.tz_convert("Asia/Seoul").dt.date
+            )
+
+            # 1) 차트 유형
+            chart_type = st.radio(
+                "차트 유형",
+                ["원형(비중)", "막대(합계)", "일별 막대(전체/선택)"],
+                index=0,
+                horizontal=True,
+                key="chart_type_selector",
+            )
+
+            # ----- 1-a) 원형(비중)
+            if chart_type == "원형(비중)":
                 fig1, ax1 = plt.subplots()
                 ax1.pie(sum_df["minutes"], labels=sum_df["category"], autopct="%1.0f%%")
                 ax1.set_title(f"{period} 카테고리 비중")
                 st.pyplot(fig1)
 
-                st.markdown(f"**합계: {fmt_minutes(total)} ({total}분)**")
+            # ----- 1-b) 막대(합계)
+            elif chart_type == "막대(합계)":
+                fig2, ax2 = plt.subplots()
+                ax2.bar(sum_df["category"], sum_df["minutes"])
+                ax2.set_xlabel("카테고리"); ax2.set_ylabel("분"); ax2.set_title(f"{period} 카테고리별 합계(분)")
+                plt.xticks(rotation=0)
+                st.pyplot(fig2)
 
-    with right:
-        st.markdown("#### 차트")
-        if df.empty:
-            st.info("기록이 없습니다.")
-        else:
-            daily = df.copy()
-            daily["date"] = pd.to_datetime(daily["start_iso"]).dt.tz_convert("Asia/Seoul").dt.date
-            daily_sum = daily.groupby("date")["minutes"].sum().reset_index()
+            # ----- 1-c) 일별 막대(전체/선택) : 누적/그룹형 옵션
+            else:
+                st.divider()
+                st.markdown("##### 일별 막대 옵션")
 
-            fig2, ax2 = plt.subplots()
-            ax2.bar(daily_sum["date"].astype(str), daily_sum["minutes"])
-            ax2.set_xlabel("날짜"); ax2.set_ylabel("분"); ax2.set_title("일별 총합(분)")
-            plt.xticks(rotation=45, ha="right")
-            st.pyplot(fig2)
+                cat_pick = st.radio(
+                    "대상",
+                    options=["(전체)"] + sum_df["category"].tolist(),
+                    horizontal=True,
+                    key="bar_cat_pick",
+                )
 
-            cat_daily = daily.groupby(["date","category"])["minutes"].sum().reset_index()
-            pivot = cat_daily.pivot(index="date", columns="category", values="minutes").fillna(0)
+                bar_mode = st.radio(
+                    "막대 모드",
+                    options=["누적", "그룹형"],
+                    horizontal=True,
+                    key="bar_mode_selector",
+                )
 
-            fig3, ax3 = plt.subplots()
-            pivot.plot(ax=ax3)
-            ax3.set_xlabel("날짜"); ax3.set_ylabel("분"); ax3.set_title("카테고리별 일별 분")
-            plt.xticks(rotation=45, ha="right")
-            st.pyplot(fig3)
+                cat_daily = clip_df.groupby(["date", "category"])["minutes_clip"].sum().reset_index()
+                pivot = cat_daily.pivot(index="date", columns="category", values="minutes_clip").fillna(0)
+
+                if cat_pick == "(전체)":
+                    if pivot.empty:
+                        st.info("표시할 데이터가 없습니다.")
+                    else:
+                        if bar_mode == "누적":
+                            fig3, ax3 = plt.subplots()
+                            pivot.plot(kind="bar", stacked=True, ax=ax3)
+                            ax3.set_xlabel("날짜"); ax3.set_ylabel("분")
+                            ax3.set_title(f"{period} 일별 누적 막대(전체)")
+                            plt.xticks(rotation=45, ha="right")
+                            st.pyplot(fig3)
+                        else:
+                            fig4, ax4 = plt.subplots()
+                            dates = pivot.index.astype(str).tolist()
+                            cats = pivot.columns.tolist()
+                            x = range(len(dates))
+                            width = 0.8 / max(1, len(cats))
+                            for i, c in enumerate(cats):
+                                ax4.bar(
+                                    [xi + (i - (len(cats)-1)/2)*width for xi in x],
+                                    pivot[c].values,
+                                    width=width,
+                                    label=c,
+                                )
+                            ax4.set_xticks(list(x), dates, rotation=45, ha="right")
+                            ax4.set_xlabel("날짜"); ax4.set_ylabel("분")
+                            ax4.set_title(f"{period} 일별 그룹형 막대(전체)")
+                            ax4.legend(ncol=min(4, len(cats)))
+                            st.pyplot(fig4)
+                else:
+                    sub = pivot[[cat_pick]] if cat_pick in pivot.columns else pd.DataFrame(index=pivot.index)
+                    sub = sub.rename(columns={cat_pick: "minutes"}).fillna(0)
+                    if sub.empty:
+                        st.info("표시할 데이터가 없습니다.")
+                    else:
+                        fig5, ax5 = plt.subplots()
+                        ax5.bar(sub.index.astype(str), sub["minutes"].values)
+                        ax5.set_xlabel("날짜"); ax5.set_ylabel("분")
+                        ax5.set_title(f"{period} [{cat_pick}] 일별 합계(분)")
+                        plt.xticks(rotation=45, ha="right")
+                        st.pyplot(fig5)
 
     st.divider()
 
-    # --- 로그
+    # --- 최근 로그
     st.subheader("📜 최근 기록")
     if df.empty:
         st.info("기록이 없습니다.")
@@ -674,17 +715,56 @@ def render_reminder_page():
                 if fired:
                     save_reminders_df(rem_df); st.success(f"{fired}건 처리")
 
-# =============================
+# -----------------------------
+# 라우팅 & 사이드바
+# -----------------------------
+st.sidebar.markdown("## 📂 페이지")
+PAGE_TRACKER = "자기계발 시간 트래커"
+PAGE_REMINDER = "일정 리마인더"
+page = st.sidebar.radio("이동", [PAGE_TRACKER, PAGE_REMINDER], index=0, key="nav_page")
+
+st.sidebar.title("⚙️ 설정 / 데이터")
+st.sidebar.caption(f"저장소: **{BACKEND.upper()}**")
+
+cats = load_categories()
+with st.sidebar:
+    st.header("카테고리")
+    st.write(", ".join(sorted(cats)) if cats else "(없음)")
+    with st.form("cat_form", clear_on_submit=True):
+        new_cat = st.text_input("카테고리 추가", "", key="cat_add")
+        rm_cat = st.multiselect("카테고리 삭제", options=sorted(cats), key="cat_rm")
+        submitted_cat = st.form_submit_button("저장")
+        if submitted_cat:
+            changed = False
+            if new_cat and new_cat not in cats:
+                cats.append(new_cat); changed = True
+            for c in rm_cat:
+                if c in cats:
+                    cats.remove(c); changed = True
+            if changed:
+                save_categories(cats); st.success("카테고리 업데이트 완료")
+            else:
+                st.info("변경사항이 없습니다.")
+    if st.button("🔤 카테고리 한글로 통일"):
+        migrate_categories_to_korean(); st.success("카테고리/기록을 한글로 변환했습니다!")
+
+    st.divider()
+    st.header("데이터 백업 (CSV)")
+    if os.path.exists(TRACKS_CSV):
+        with open(TRACKS_CSV, "rb") as f:
+            st.download_button("CSV 내보내기(트래킹)", f, file_name="tracks.csv", mime="text/csv")
+    if os.path.exists(REMINDERS_CSV):
+        with open(REMINDERS_CSV, "rb") as f:
+            st.download_button("CSV 내보내기(리마인더)", f, file_name="reminders.csv", mime="text/csv")
+
 # 라우팅
-# =============================
-st.set_page_config(page_title="자기계발 트래커 / 일정 리마인더", page_icon="⏱️", layout="wide")
 if page == PAGE_TRACKER:
     render_tracker_page()
-elif page == PAGE_REMINDER:
+else:
     render_reminder_page()
 
 # =============================
-# 리마인더 감지 & 자동 새로고침(앱 열려 있을 때)
+# 리마인더 감지 & 자동 새로고침
 # =============================
 def scan_and_fire():
     rem_df = load_reminders_df()
