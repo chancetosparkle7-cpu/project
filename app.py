@@ -18,9 +18,9 @@ try:
 except Exception:
     requests = None
 
-# -----------------------------
-# 설정 & 경로
-# -----------------------------
+# =============================
+# 경로 & 상수
+# =============================
 APP_DIR = os.path.join(".", ".habit_tracker")  # 리포 루트 기준
 TRACKS_CSV = os.path.join(APP_DIR, "tracks.csv")
 STATE_JSON = os.path.join(APP_DIR, "running.json")
@@ -55,9 +55,9 @@ def ensure_files():
 
 ensure_files()
 
-# -----------------------------
+# =============================
 # 공통 유틸
-# -----------------------------
+# =============================
 def now():
     return datetime.now(KST)
 
@@ -72,9 +72,9 @@ def fmt_minutes(mins: int):
     m = mins % 60
     return f"{h}h {m}m" if h else f"{m}m"
 
-# -----------------------------
+# =============================
 # 카테고리
-# -----------------------------
+# =============================
 def load_categories():
     try:
         with open(CATEGORIES_JSON, "r", encoding="utf-8") as f:
@@ -87,9 +87,9 @@ def save_categories(cats):
     with open(CATEGORIES_JSON, "w", encoding="utf-8") as f:
         json.dump(sorted(set(cats)), f, ensure_ascii=False, indent=2)
 
-# -----------------------------
-# 타이머/트래킹
-# -----------------------------
+# =============================
+# 타이머 / 트래킹
+# =============================
 def read_state():
     if not os.path.exists(STATE_JSON):
         return None
@@ -139,12 +139,8 @@ def daterange_start_end(kind: str):
         end = start + timedelta(days=7)
     elif kind == "이번 달":
         start = now_kst.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        # 다음달 1일 계산
         y, m = start.year, start.month
-        if m == 12:
-            end = start.replace(year=y+1, month=1)
-        else:
-            end = start.replace(month=m+1)
+        end = start.replace(year=y+1, month=1) if m == 12 else start.replace(month=m+1)
     elif kind == "전체":
         start = datetime(1970,1,1,tzinfo=KST)
         end = datetime(2999,1,1,tzinfo=KST)
@@ -166,16 +162,15 @@ def summarize(df: pd.DataFrame, start: datetime, end: datetime):
     total = int(df["overlap_minutes"].sum())
     return by_cat, total
 
-# -----------------------------
+# =============================
 # 리마인더
-# -----------------------------
+# =============================
 REPEAT_CHOICES = ["없음", "매일", "매주", "매월"]
 
 def load_reminders_df() -> pd.DataFrame:
     df = pd.read_csv(REMINDERS_CSV, encoding="utf-8")
     if df.empty:
         return df
-    # 타입 보정
     for col in ["due_iso", "last_fired_iso"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
@@ -220,12 +215,8 @@ def compute_next_due(due_dt: datetime, repeat: str) -> datetime | None:
     if repeat == "매주":
         return due_dt + timedelta(weeks=1)
     if repeat == "매월":
-        # 말일 안전 처리
         y, m = due_dt.year, due_dt.month
-        if m == 12:
-            ny, nm = y + 1, 1
-        else:
-            ny, nm = y, m + 1
+        ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
         last_day = monthrange(ny, nm)[1]
         day = min(due_dt.day, last_day)
         return due_dt.replace(year=ny, month=nm, day=day)
@@ -274,19 +265,26 @@ def send_slack(title: str, body: str) -> bool:
     except Exception:
         return False
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="자기계발 트래커 + 리마인더", page_icon="⏱️", layout="wide")
+# =============================
+# 페이지 구성
+# =============================
+st.set_page_config(page_title="자기계발 트래커 / 일정 리마인더", page_icon="⏱️", layout="wide")
 
+# --- 왼쪽 네비게이션
+st.sidebar.markdown("## 📂 페이지")
+PAGE_TRACKER = "자기계발 시간 트래커"
+PAGE_REMINDER = "일정 리마인더"
+page = st.sidebar.radio("이동", [PAGE_TRACKER, PAGE_REMINDER], index=0, key="nav_page")
+
+# --- 공용: 설정/데이터(사이드바)
 st.sidebar.title("⚙️ 설정 / 데이터")
 cats = load_categories()
 with st.sidebar:
     st.header("카테고리")
     st.write(", ".join(sorted(cats)) if cats else "(없음)")
     with st.form("cat_form", clear_on_submit=True):
-        new_cat = st.text_input("카테고리 추가", "")
-        rm_cat = st.multiselect("카테고리 삭제", options=sorted(cats))
+        new_cat = st.text_input("카테고리 추가", "", key="cat_add")
+        rm_cat = st.multiselect("카테고리 삭제", options=sorted(cats), key="cat_rm")
         submitted_cat = st.form_submit_button("저장")
         if submitted_cat:
             changed = False
@@ -339,144 +337,149 @@ with st.sidebar:
         except Exception as e:
             st.error(f"가져오기 실패: {e}")
 
-st.title("⏱️ 자기계발 시간 트래커 + 🔔 일정 리마인더")
-st.caption("KST 기준 · CSV 영속 · 타이머/수동기록 · 요약/차트 · 리마인더(사전 알림, 반복, Slack 연동)")
+# =============================
+# 페이지별 렌더러
+# =============================
+def render_tracker_page():
+    st.title("⏱️ 자기계발 시간 트래커")
+    st.caption("KST 기준 · CSV 영속 · 타이머/수동기록 · 요약/차트")
 
-# ---- 상단: 타이머/수동입력
-if "running" not in st.session_state:
-    st.session_state.running = read_state()
+    if "running" not in st.session_state:
+        st.session_state.running = read_state()
 
-col1, col2 = st.columns([2, 3], gap="large")
+    col1, col2 = st.columns([2, 3], gap="large")
 
-with col1:
-    st.subheader("실시간 타이머")
-    with st.container(border=True):
-        running = st.session_state.running
-        if running:
-            cat = running["category"]
-            start_iso = running["start_iso"]
-            note = running.get("note", "")
-            start_dt = parse_iso(start_iso)
-            elapsed_min = int((now() - start_dt).total_seconds() // 60)
-            st.write(f"**진행 중**: [{cat}] {start_iso} 시작")
-            st.write(f"경과: **{elapsed_min}분**")
-            if note:
-                st.write(f"메모: {note}")
-            stop_note = st.text_input("종료 시 메모(옵션)", value=note, key="stop_note")
-            if st.button("🛑 세션 종료/기록"):
-                try:
-                    minutes = append_track(start_dt, now(), cat, stop_note)
-                    clear_state(); st.session_state.running = None
-                    st.success(f"세션 종료: [{cat}] {minutes}분 기록")
-                except Exception as e:
-                    st.error(f"기록 실패: {e}")
-        else:
+    # --- 타이머
+    with col1:
+        st.subheader("실시간 타이머")
+        with st.container(border=True):
+            running = st.session_state.running
+            if running:
+                cat = running["category"]
+                start_iso = running["start_iso"]
+                note = running.get("note", "")
+                start_dt = parse_iso(start_iso)
+                elapsed_min = int((now() - start_dt).total_seconds() // 60)
+                st.write(f"**진행 중**: [{cat}] {start_iso} 시작")
+                st.write(f"경과: **{elapsed_min}분**")
+                if note:
+                    st.write(f"메모: {note}")
+                stop_note = st.text_input("종료 시 메모(옵션)", value=note, key="stop_note")
+                if st.button("🛑 세션 종료/기록"):
+                    try:
+                        minutes = append_track(start_dt, now(), cat, stop_note)
+                        clear_state(); st.session_state.running = None
+                        st.success(f"세션 종료: [{cat}] {minutes}분 기록")
+                    except Exception as e:
+                        st.error(f"기록 실패: {e}")
+            else:
+                cats = load_categories()
+                start_cat = st.selectbox("카테고리", options=sorted(cats) if cats else ["공부"])
+                start_note = st.text_input("메모(옵션)", "", key="start_note")
+                if st.button("▶️ 세션 시작"):
+                    state = {"category": start_cat, "start_iso": iso(now()), "note": start_note}
+                    write_state(state); st.session_state.running = state
+                    st.success(f"세션 시작: [{start_cat}] {state['start_iso']}")
+
+    # --- 수동 입력
+    with col2:
+        st.subheader("수동 입력(분 단위)")
+        with st.container(border=True):
             cats = load_categories()
-            start_cat = st.selectbox("카테고리", options=sorted(cats) if cats else ["공부"])
-            start_note = st.text_input("메모(옵션)", "", key="start_note")
-            if st.button("▶️ 세션 시작"):
-                state = {"category": start_cat, "start_iso": iso(now()), "note": start_note}
-                write_state(state); st.session_state.running = state
-                st.success(f"세션 시작: [{start_cat}] {state['start_iso']}")
+            add_cat = st.selectbox("카테고리 선택", options=sorted(cats) if cats else ["공부"], key="add_cat")
+            add_min = st.number_input("분(1 이상)", min_value=1, step=5, value=30)
+            add_note = st.text_input("메모", "", key="add_note")
+            if st.button("➕ 기록 추가"):
+                try:
+                    end_dt = now()
+                    start_dt = end_dt - timedelta(minutes=int(add_min))
+                    append_track(start_dt, end_dt, add_cat, add_note)
+                    st.success(f"수동 입력 완료: [{add_cat}] {int(add_min)}분")
+                except Exception as e:
+                    st.error(f"입력 실패: {e}")
 
-with col2:
-    st.subheader("수동 입력(분 단위)")
-    with st.container(border=True):
-        cats = load_categories()
-        add_cat = st.selectbox("카테고리 선택", options=sorted(cats) if cats else ["공부"], key="add_cat")
-        add_min = st.number_input("분(1 이상)", min_value=1, step=5, value=30)
-        add_note = st.text_input("메모", "", key="add_note")
-        if st.button("➕ 기록 추가"):
-            try:
-                end_dt = now()
-                start_dt = end_dt - timedelta(minutes=int(add_min))
-                append_track(start_dt, end_dt, add_cat, add_note)
-                st.success(f"수동 입력 완료: [{add_cat}] {int(add_min)}분")
-            except Exception as e:
-                st.error(f"입력 실패: {e}")
+    st.divider()
 
-st.divider()
+    # --- 요약/로그/차트
+    df = read_all_tracks_df()
+    tabs = st.tabs(["📊 요약", "📜 로그", "📈 차트"])
 
-# ---- 탭
-df = read_all_tracks_df()
-tabs = st.tabs(["📊 요약", "📜 로그", "📈 차트", "🔔 리마인더"])
-
-with tabs[0]:
-    period = st.selectbox("기간", ["오늘", "어제", "이번 주", "이번 달", "전체"], index=0)
-    start, end = daterange_start_end(period)
-    if df.empty:
-        st.info("아직 기록이 없습니다.")
-    else:
-        by_cat, total = summarize(df, start, end)
-        st.markdown(f"**{period} 요약**  \n({start.date()} ~ {(end - timedelta(seconds=1)).date()})")
-        if total == 0:
-            st.write("해당 기간 기록이 없습니다.")
+    with tabs[0]:
+        period = st.selectbox("기간", ["오늘", "어제", "이번 주", "이번 달", "전체"], index=0, key="sum_period")
+        start, end = daterange_start_end(period)
+        if df.empty:
+            st.info("아직 기록이 없습니다.")
         else:
-            sum_df = (
-                pd.DataFrame([{"category": k, "minutes": v} for k, v in by_cat.items()])
-                .sort_values("minutes", ascending=False)
-                .reset_index(drop=True)
-            )
-            sum_df["formatted"] = sum_df["minutes"].apply(lambda m: fmt_minutes(int(m)))
-            st.dataframe(sum_df, use_container_width=True, hide_index=True)
+            by_cat, total = summarize(df, start, end)
+            st.markdown(f"**{period} 요약**  \n({start.date()} ~ {(end - timedelta(seconds=1)).date()})")
+            if total == 0:
+                st.write("해당 기간 기록이 없습니다.")
+            else:
+                sum_df = (
+                    pd.DataFrame([{"category": k, "minutes": v} for k, v in by_cat.items()])
+                    .sort_values("minutes", ascending=False)
+                    .reset_index(drop=True)
+                )
+                sum_df["formatted"] = sum_df["minutes"].apply(lambda m: fmt_minutes(int(m)))
+                st.dataframe(sum_df, use_container_width=True, hide_index=True)
 
-            fig1, ax1 = plt.subplots()
-            ax1.pie(sum_df["minutes"], labels=sum_df["category"], autopct="%1.0f%%")
-            ax1.set_title(f"{period} 카테고리 비중")
-            st.pyplot(fig1)
+                fig1, ax1 = plt.subplots()
+                ax1.pie(sum_df["minutes"], labels=sum_df["category"], autopct="%1.0f%%")
+                ax1.set_title(f"{period} 카테고리 비중")
+                st.pyplot(fig1)
 
-            st.markdown(f"**합계: {fmt_minutes(total)} ({total}분)**")
+                st.markdown(f"**합계: {fmt_minutes(total)} ({total}분)**")
 
-with tabs[1]:
-    st.markdown("### 최근 기록")
-    if df.empty:
-        st.info("기록이 없습니다.")
-    else:
-        df_view = df.copy().sort_values("start", ascending=False)
-        df_view = df_view[["category","start_iso","end_iso","minutes","note"]]
-        st.dataframe(df_view, use_container_width=True)
+    with tabs[1]:
+        st.markdown("### 최근 기록")
+        if df.empty:
+            st.info("기록이 없습니다.")
+        else:
+            df_view = df.copy().sort_values("start", ascending=False)
+            df_view = df_view[["category","start_iso","end_iso","minutes","note"]]
+            st.dataframe(df_view, use_container_width=True)
 
-with tabs[2]:
-    st.markdown("### 일별 합계(막대)")
-    if df.empty:
-        st.info("기록이 없습니다.")
-    else:
-        daily = df.copy()
-        daily["date"] = pd.to_datetime(daily["start_iso"]).dt.tz_convert("Asia/Seoul").dt.date
-        daily_sum = daily.groupby("date")["minutes"].sum().reset_index()
-        fig2, ax2 = plt.subplots()
-        ax2.bar(daily_sum["date"].astype(str), daily_sum["minutes"])
-        ax2.set_xlabel("날짜"); ax2.set_ylabel("분"); ax2.set_title("일별 총합(분)")
-        plt.xticks(rotation=45, ha="right")
-        st.pyplot(fig2)
+    with tabs[2]:
+        st.markdown("### 일별 합계(막대)")
+        if df.empty:
+            st.info("기록이 없습니다.")
+        else:
+            daily = df.copy()
+            daily["date"] = pd.to_datetime(daily["start_iso"]).dt.tz_convert("Asia/Seoul").dt.date
+            daily_sum = daily.groupby("date")["minutes"].sum().reset_index()
+            fig2, ax2 = plt.subplots()
+            ax2.bar(daily_sum["date"].astype(str), daily_sum["minutes"])
+            ax2.set_xlabel("날짜"); ax2.set_ylabel("분"); ax2.set_title("일별 총합(분)")
+            plt.xticks(rotation=45, ha="right")
+            st.pyplot(fig2)
 
-        st.markdown("### 카테고리별 일별 추이(선)")
-        cat_daily = daily.groupby(["date","category"])["minutes"].sum().reset_index()
-        pivot = cat_daily.pivot(index="date", columns="category", values="minutes").fillna(0)
-        fig3, ax3 = plt.subplots()
-        pivot.plot(ax=ax3)
-        ax3.set_xlabel("날짜"); ax3.set_ylabel("분"); ax3.set_title("카테고리별 일별 분")
-        plt.xticks(rotation=45, ha="right")
-        st.pyplot(fig3)
+            st.markdown("### 카테고리별 일별 추이(선)")
+            cat_daily = daily.groupby(["date","category"])["minutes"].sum().reset_index()
+            pivot = cat_daily.pivot(index="date", columns="category", values="minutes").fillna(0)
+            fig3, ax3 = plt.subplots()
+            pivot.plot(ax=ax3)
+            ax3.set_xlabel("날짜"); ax3.set_ylabel("분"); ax3.set_title("카테고리별 일별 분")
+            plt.xticks(rotation=45, ha="right")
+            st.pyplot(fig3)
 
-# -----------------------------
-# 🔔 리마인더 탭
-# -----------------------------
-with tabs[3]:
+def render_reminder_page():
+    st.title("🔔 일정 리마인더")
+    st.caption("사전 알림 · 반복 · Slack 연동")
+
     st.markdown("### 리마인더 추가")
     rc1, rc2 = st.columns(2)
     with rc1:
         r_title = st.text_input("제목", placeholder="예: 오늘 독서 30분", key="reminder_title")
         r_cat = st.selectbox("관련 카테고리(옵션)", options=["(없음)"] + sorted(load_categories()))
-        r_note  = st.text_input("메모(옵션)", "", key="reminder_note")
+        r_note = st.text_input("메모(옵션)", "", key="reminder_note")
     with rc2:
         today = now()
-        r_date = st.date_input("기한 날짜", value=today.date())
-        r_time = st.time_input("기한 시각", value=today.replace(second=0, microsecond=0).time())
-        r_adv = st.number_input("사전 알림(분)", min_value=0, step=5, value=10)
-        r_rep = st.selectbox("반복", REPEAT_CHOICES, index=0)
+        r_date = st.date_input("기한 날짜", value=today.date(), key="rem_date")
+        r_time = st.time_input("기한 시각", value=today.replace(second=0, microsecond=0).time(), key="rem_time")
+        r_adv  = st.number_input("사전 알림(분)", min_value=0, step=5, value=10, key="rem_adv")
+        r_rep  = st.selectbox("반복", REPEAT_CHOICES, index=0, key="rem_repeat")
 
-    if st.button("➕ 리마인더 생성"):
+    if st.button("➕ 리마인더 생성", key="rem_add_btn"):
         if not r_title.strip():
             st.error("제목은 필수입니다.")
         else:
@@ -509,24 +512,24 @@ with tabs[3]:
         st.dataframe(view, use_container_width=True, hide_index=True)
 
         st.markdown("#### 선택 항목 관리")
-        sel = st.multiselect("리마인더 선택(ID)", options=view["id"].tolist())
+        sel = st.multiselect("리마인더 선택(ID)", options=view["id"].tolist(), key="rem_select")
         c1, c2, c3 = st.columns(3)
         with c1:
-            if st.button("선택 비활성화"):
+            if st.button("선택 비활성화", key="rem_disable"):
                 if sel:
                     rem_df.loc[rem_df["id"].isin(sel), "active"] = False
                     save_reminders_df(rem_df); st.success("비활성화 완료")
                 else:
                     st.info("선택된 항목이 없습니다.")
         with c2:
-            if st.button("선택 삭제"):
+            if st.button("선택 삭제", key="rem_delete"):
                 if sel:
                     rem_df = rem_df[~rem_df["id"].isin(sel)]
                     save_reminders_df(rem_df); st.success("삭제 완료")
                 else:
                     st.info("선택된 항목이 없습니다.")
         with c3:
-            if st.button("선택 즉시 발송(테스트)"):
+            if st.button("선택 즉시 발송(테스트)", key="rem_test_send"):
                 now_dt = now()
                 fired = 0
                 for rid in sel:
@@ -541,9 +544,17 @@ with tabs[3]:
                 if fired:
                     save_reminders_df(rem_df); st.success(f"{fired}건 처리")
 
-# -----------------------------
-# 리마인더 감지 & 자동 새로고침
-# -----------------------------
+# =============================
+# 페이지 라우팅
+# =============================
+if page == PAGE_TRACKER:
+    render_tracker_page()
+elif page == PAGE_REMINDER:
+    render_reminder_page()
+
+# =============================
+# 리마인더 감지 & 자동 새로고침(앱 열려 있을 때)
+# =============================
 def scan_and_fire():
     rem_df = load_reminders_df()
     if rem_df.empty:
@@ -566,13 +577,9 @@ def scan_and_fire():
     if fired_any:
         save_reminders_df(rem_df)
 
-# 실행 시마다 스캔 + JS로 1분마다 새로고침
 scan_and_fire()
 st.markdown(
     "<script>setTimeout(() => window.location.reload(), 60*1000);</script>",
     unsafe_allow_html=True
 )
 st.caption("💡 리마인더는 *앱이 열려 있을 때* 1분 간격으로 감지/발송됩니다. Slack 웹훅(SLACK_WEBHOOK_URL)을 설정하면 채널로도 알림을 보낼 수 있어요.")
-
-
-
