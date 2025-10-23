@@ -3,20 +3,21 @@
 
 import os, csv, json, uuid
 from datetime import datetime, timedelta, timezone
+from calendar import monthrange
 import pandas as pd
 import streamlit as st
 
-# =========================
+# -------------------------
 # 기본 설정
-# =========================
+# -------------------------
 st.set_page_config(page_title="자기계발 트래커 / 일정 리마인더", page_icon="⏱️", layout="wide")
 
-APP_DIR = os.path.join(".", ".habit_tracker")
-TRACKS_CSV = os.path.join(APP_DIR, "tracks.csv")
-REMINDERS_CSV = os.path.join(APP_DIR, "reminders.csv")
-CATEGORIES_JSON = os.path.join(APP_DIR, "categories.json")
-GOALS_JSON = os.path.join(APP_DIR, "goals.json")
-STATE_JSON = os.path.join(APP_DIR, "running.json")
+APP_DIR        = os.path.join(".", ".habit_tracker")
+TRACKS_CSV     = os.path.join(APP_DIR, "tracks.csv")
+REMINDERS_CSV  = os.path.join(APP_DIR, "reminders.csv")
+CATEGORIES_JSON= os.path.join(APP_DIR, "categories.json")
+GOALS_JSON     = os.path.join(APP_DIR, "goals.json")
+STATE_JSON     = os.path.join(APP_DIR, "running.json")
 
 DEFAULT_CATEGORIES = ["공부", "운동", "독서", "글쓰기", "외국어", "명상"]
 KST = timezone(timedelta(hours=9))
@@ -26,24 +27,38 @@ os.makedirs(APP_DIR, exist_ok=True)
 def now(): return datetime.now(KST)
 def iso(dt): return dt.astimezone(KST).isoformat(timespec="seconds")
 
-# =========================
+
+# -------------------------
+# 의존성 (Slack 전송)
+# -------------------------
+try:
+    import requests
+except Exception:
+    requests = None
+
+
+# -------------------------
 # 파일 초기화
-# =========================
+# -------------------------
 def ensure_files():
     if not os.path.exists(TRACKS_CSV):
         with open(TRACKS_CSV, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(["start_iso","end_iso","minutes","category","note"])
     if not os.path.exists(REMINDERS_CSV):
         with open(REMINDERS_CSV, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["id","title","category","note","due_iso","advance_minutes","repeat","active","last_fired_iso"])
+            csv.writer(f).writerow([
+                "id","title","category","note",
+                "due_iso","advance_minutes","repeat","active","last_fired_iso"
+            ])
     if not os.path.exists(CATEGORIES_JSON):
         with open(CATEGORIES_JSON, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CATEGORIES, f, ensure_ascii=False, indent=2)
 ensure_files()
 
-# =========================
+
+# -------------------------
 # 카테고리
-# =========================
+# -------------------------
 def load_categories():
     try:
         with open(CATEGORIES_JSON, "r", encoding="utf-8") as f:
@@ -57,9 +72,10 @@ def save_categories(cats):
     with open(CATEGORIES_JSON, "w", encoding="utf-8") as f:
         json.dump(cats, f, ensure_ascii=False, indent=2)
 
-# =========================
+
+# -------------------------
 # 상태/목표 (목표는 분으로 저장)
-# =========================
+# -------------------------
 def read_state():
     if not os.path.exists(STATE_JSON): return None
     try:
@@ -80,19 +96,19 @@ def load_goals():
                 base = json.load(f) or base
         except Exception:
             pass
-    # 카테고리 누락 보정
     for c in load_categories():
-        base["weekly"].setdefault(c, 0)   # 저장 값은 "분"
-        base["monthly"].setdefault(c, 0)
+        base["weekly"].setdefault(c, 0)   # 분
+        base["monthly"].setdefault(c, 0)  # 분
     return base
 
 def save_goals(goals):
     with open(GOALS_JSON, "w", encoding="utf-8") as f:
         json.dump(goals, f, ensure_ascii=False, indent=2)
 
-# =========================
+
+# -------------------------
 # 트래킹 데이터
-# =========================
+# -------------------------
 def append_track(start_dt, end_dt, category, note=""):
     mins = int((end_dt - start_dt).total_seconds() / 60)
     if mins <= 0: mins = 1
@@ -109,9 +125,10 @@ def read_all_tracks():
     df["row_id"] = df.index.astype(str)
     return df
 
-# =========================
-# 리마인더 (간단)
-# =========================
+
+# -------------------------
+# 리마인더
+# -------------------------
 def load_reminders():
     df = pd.read_csv(REMINDERS_CSV, encoding="utf-8")
     if df.empty: return df
@@ -131,19 +148,70 @@ def add_reminder(title, category, note, due_dt, advance, repeat):
     df = load_reminders()
     rid = str(uuid.uuid4())
     row = {
-        "id": rid, "title": title, "category": category,
-        "note": note, "due_iso": due_dt, "advance_minutes": int(advance),
+        "id": rid, "title": title, "category": category, "note": note,
+        "due_iso": due_dt, "advance_minutes": int(advance),
         "repeat": repeat, "active": True, "last_fired_iso": pd.NaT
     }
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     save_reminders(df)
+    return rid
 
-# =========================
+def compute_next_due(due_dt: datetime, repeat: str):
+    if repeat == "없음": return None
+    if repeat == "매일": return due_dt + timedelta(days=1)
+    if repeat == "매주": return due_dt + timedelta(weeks=1)
+    if repeat == "매월":
+        y, m = due_dt.year, due_dt.month
+        ny, nm = (y+1, 1) if m == 12 else (y, m+1)
+        # 월 말 보정
+        last = monthrange(ny, nm)[1]
+        d = min(due_dt.day, last)
+        return due_dt.replace(year=ny, month=nm, day=d)
+    return None
+
+def send_slack(title: str, body: str) -> bool:
+    if requests is None: return False
+    url = st.secrets.get("SLACK_WEBHOOK_URL")
+    if not url: return False
+    try:
+        r = requests.post(url, json={"text": f":alarm_clock: *{title}*\n{body}"}, timeout=5)
+        return 200 <= r.status_code < 300
+    except Exception:
+        return False
+
+def should_fire_row(row, now_dt: datetime) -> bool:
+    if not bool(row.get("active", True)): return False
+    due = row.get("due_iso")
+    if pd.isna(due): return False
+    adv = int(row.get("advance_minutes", 0))
+    window_start = due - timedelta(minutes=adv)
+    last = row.get("last_fired_iso")
+    # 동일 윈도 내 중복 방지
+    if pd.notna(last) and (window_start <= last <= due + timedelta(minutes=5)):
+        return False
+    return now_dt >= window_start
+
+def mark_fired_and_roll(df: pd.DataFrame, rid: str, fired_dt: datetime) -> pd.DataFrame:
+    idx = df.index[df["id"] == rid]
+    if len(idx) == 0: return df
+    i = idx[0]
+    df.at[i, "last_fired_iso"] = pd.to_datetime(fired_dt.isoformat())
+    repeat = df.at[i, "repeat"]
+    due = df.at[i, "due_iso"]
+    if pd.notna(due):
+        nxt = compute_next_due(due.to_pydatetime().astimezone(KST), repeat)
+        if nxt is None:
+            df.at[i, "active"] = False
+        else:
+            df.at[i, "due_iso"] = pd.to_datetime(nxt.isoformat())
+    return df
+
+
+# -------------------------
 # 기간/요약 유틸
-# =========================
+# -------------------------
 def week_range_kst(dt: datetime):
-    # ISO 주: 월요일 시작
-    weekday = dt.isoweekday()
+    weekday = dt.isoweekday()  # 월=1
     start = dt.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=weekday-1)
     end = start + timedelta(days=7)
     return start, end
@@ -157,7 +225,6 @@ def month_range_kst(dt: datetime):
     return start, end
 
 def summarize_minutes_by_cat(df: pd.DataFrame, start: datetime, end: datetime):
-    """start~end 사이 겹치는 분을 카테고리별 합산"""
     if df.empty: return {}
     s = pd.to_datetime(start.isoformat()); e = pd.to_datetime(end.isoformat())
     tmp = df.copy()
@@ -168,9 +235,34 @@ def summarize_minutes_by_cat(df: pd.DataFrame, start: datetime, end: datetime):
     grp = tmp.groupby("category")["overlap_minutes"].sum()
     return grp.to_dict()
 
-# =========================
+
+# -------------------------
+# UI 헬퍼: 목표 초과 배지
+# -------------------------
+def badge(text: str, kind: str = "ok"):
+    # kind: ok / warn / over
+    colors = {
+        "ok":   "#e6f7ff",  # 연한 파랑
+        "warn": "#fff7e6",  # 연한 주황
+        "over": "#e6fffb",  # 연한 청록
+    }
+    border = {
+        "ok":   "#91d5ff",
+        "warn": "#ffd591",
+        "over": "#87e8de",
+    }
+    return f"""
+    <div style="display:inline-block;padding:6px 10px;border-radius:8px;
+        background:{colors.get(kind,'#e6f7ff')};
+        border:1px solid {border.get(kind,'#91d5ff')}; font-size:13px;">
+        {text}
+    </div>
+    """
+
+
+# -------------------------
 # 페이지: 트래커
-# =========================
+# -------------------------
 def render_tracker_page():
     st.title("⏱️ 자기계발 시간 트래커")
 
@@ -216,7 +308,7 @@ def render_tracker_page():
 
     st.divider()
 
-    # 최근 기록 & 목표 대비 게이지
+    # 최근 기록
     df = read_all_tracks()
     st.subheader("📜 최근 기록")
     if df.empty:
@@ -231,50 +323,80 @@ def render_tracker_page():
 
     st.divider()
 
-    # ===== 목표 대비 진행률 (시간 단위 게이지) =====
+    # ========= 목표 대비 진행률 (시간 단위) + 임의 기간 선택 =========
     st.subheader("🎯 목표 대비 진행률 (시간 단위 게이지)")
-    col_unit, col_hint = st.columns([1,3])
-    with col_unit:
-        agg_unit = st.radio("집계 단위", ["주", "월"], horizontal=True)
-    with col_hint:
-        st.caption("주/월 목표는 사이드바에서 '시간' 단위로 설정합니다. 진행률은 각 기간(이번 주/이번 달) 누적 시간을 기준으로 계산합니다.")
 
-    # 기간 계산
-    now_k = now()
-    if agg_unit == "주":
-        start_p, end_p = week_range_kst(now_k)
+    period_mode = st.radio("집계 단위", ["주", "월", "직접 선택"], horizontal=True, index=0)
+    if period_mode == "주":
+        start_p, end_p = week_range_kst(now())
+        st.caption(f"이번 주: {start_p.date()} ~ {(end_p - timedelta(days=1)).date()}")
+    elif period_mode == "월":
+        start_p, end_p = month_range_kst(now())
+        st.caption(f"이번 달: {start_p.date()} ~ {(end_p - timedelta(days=1)).date()}")
     else:
-        start_p, end_p = month_range_kst(now_k)
+        col_s, col_e = st.columns(2)
+        with col_s:
+            sd = st.date_input("시작일", value=now().date())
+        with col_e:
+            ed = st.date_input("종료일", value=now().date())
+        start_p = datetime.combine(sd, datetime.min.time()).replace(tzinfo=KST)
+        end_p   = datetime.combine(ed, datetime.max.time()).replace(tzinfo=KST)
+        if end_p <= start_p:
+            st.warning("종료일은 시작일 이후여야 합니다.")
+            return
 
-    by_cat = summarize_minutes_by_cat(df, start_p, end_p)  # 분 단위 dict
+    by_cat = summarize_minutes_by_cat(df, start_p, end_p)  # 분
     goals = load_goals()
-    goal_map_minutes = goals["weekly"] if agg_unit == "주" else goals["monthly"]
+    goal_map_minutes = goals["weekly"] if period_mode == "주" else (goals["monthly"] if period_mode == "월" else None)
 
     cats = sorted(load_categories())
     any_data = False
+
     for c in cats:
         cur_min = int(by_cat.get(c, 0))
-        target_min = int(goal_map_minutes.get(c, 0))
         cur_hr = cur_min / 60.0
-        target_hr = target_min / 60.0
-        if cur_min > 0 or target_min > 0:
-            any_data = True
-        # 게이지
-        pct = 1.0 if target_min <= 0 else min(1.0, cur_min / target_min)
-        # 표기: 현재시간/목표시간 (소수 1자리)
-        st.write(f"- **{c}**: {cur_hr:.1f}시간 / 목표 {target_hr:.1f}시간")
-        st.progress(pct, text=f"{int(pct*100)}%")
+
+        if goal_map_minutes is None:
+            # 직접 기간: 목표 비교 없이 현재 시간만
+            any_data = any_data or (cur_min > 0)
+            label = f"- **{c}**: {cur_hr:.1f}시간"
+            st.markdown(label)
+            st.progress(min(1.0, cur_min / (60.0 if cur_min > 0 else 1.0)), text=f"{cur_hr:.1f}h")
+        else:
+            target_min = int(goal_map_minutes.get(c, 0))
+            target_hr = target_min / 60.0
+            if cur_min > 0 or target_min > 0: any_data = True
+
+            if target_min <= 0:
+                # 목표 미설정
+                st.markdown(f"- **{c}**: {cur_hr:.1f}시간 / 목표 미설정 " + badge("목표 설정 필요", "warn"), unsafe_allow_html=True)
+                st.progress(1.0 if cur_min>0 else 0.0, text=f"{cur_hr:.1f}h")
+            else:
+                ratio = cur_min / target_min
+                pct = min(1.0, ratio)
+                # 배지/아이콘
+                if ratio >= 1.0:
+                    b = badge("목표 달성! 🔥", "over")
+                    st.markdown(f"- **{c}**: {cur_hr:.1f}시간 / 목표 {target_hr:.1f}시간 {b}", unsafe_allow_html=True)
+                elif ratio >= 0.7:
+                    b = badge("좋아요 👍", "ok")
+                    st.markdown(f"- **{c}**: {cur_hr:.1f}시간 / 목표 {target_hr:.1f}시간 {b}", unsafe_allow_html=True)
+                else:
+                    b = badge("진행 필요 ⏳", "warn")
+                    st.markdown(f"- **{c}**: {cur_hr:.1f}시간 / 목표 {target_hr:.1f}시간 {b}", unsafe_allow_html=True)
+                st.progress(pct, text=f"{int(min(100, ratio*100))}%")
+
     if not any_data:
         st.info("표시할 목표 또는 기록이 없습니다. 사이드바에서 목표를 설정해 보세요!")
 
-# =========================
+
+# -------------------------
 # 페이지: 리마인더
-# =========================
+# -------------------------
 def render_reminder_page():
     st.title("🔔 일정 리마인더")
-    st.caption("리마인더 추가 및 확인")
+    st.caption("리마인더 추가·목록 + 사전 알림(토스트/Slack)")
 
-    st.subheader("리마인더 추가")
     r1, r2 = st.columns(2)
     with r1:
         title = st.text_input("제목")
@@ -285,9 +407,10 @@ def render_reminder_page():
         due_time = st.time_input("기한 시각", value=(now().replace(second=0, microsecond=0)).time())
         advance = st.number_input("사전 알림(분)", min_value=0, step=5, value=10)
         repeat = st.selectbox("반복", ["없음","매일","매주","매월"])
+
     if st.button("➕ 추가"):
         due_dt = datetime.combine(due_date, due_time).replace(tzinfo=KST)
-        add_reminder(title, None if cat=="(없음)" else cat, note, due_dt, advance, repeat)
+        add_reminder(title.strip(), None if cat=="(없음)" else cat, note.strip(), due_dt, advance, repeat)
         st.success("리마인더 추가 완료")
 
     st.divider()
@@ -295,25 +418,61 @@ def render_reminder_page():
     if df.empty:
         st.info("등록된 리마인더가 없습니다.")
     else:
-        v = df[["title","category","due_iso","advance_minutes","repeat","active"]].rename(
-            columns={"title":"제목","category":"카테고리","due_iso":"기한(KST)","advance_minutes":"사전알림(분)","repeat":"반복","active":"활성"}
+        v = df[["title","category","due_iso","advance_minutes","repeat","active","last_fired_iso"]].rename(
+            columns={"title":"제목","category":"카테고리","due_iso":"기한(KST)","advance_minutes":"사전알림(분)","repeat":"반복","active":"활성","last_fired_iso":"마지막 발송(KST)"}
         )
-        st.dataframe(v, use_container_width=True, hide_index=True)
+        st.dataframe(v.sort_values(["active","due_iso"], ascending=[False, True]),
+                     use_container_width=True, hide_index=True)
 
-# =========================
+    # --- 사전 알림 스캔 & 발송 (앱 열려있는 동안 1분 간격)
+    scan_and_fire()
+
+
+# -------------------------
+# 알림 스캐너 (토스트 + Slack)
+# -------------------------
+def scan_and_fire():
+    df = load_reminders()
+    if df.empty: 
+        return
+    now_dt = now()
+    fired_any = False
+    for _, row in df.iterrows():
+        rowd = row.to_dict()
+        if should_fire_row(rowd, now_dt):
+            title = rowd["title"]
+            due = rowd["due_iso"]
+            adv = int(rowd.get("advance_minutes",0))
+            when = "마감 임박" if now_dt < due else "마감 도래"
+            body = f"{when} · 기한: {due}\n사전알림: {adv}분\n메모: {rowd.get('note','')}"
+            # 토스트
+            st.toast(f"🔔 {title}\n{body}")
+            # 슬랙
+            if send_slack(title, body):
+                st.info(f"Slack 전송: {title}")
+            # 롤링/비활성 처리
+            df = mark_fired_and_roll(df, rowd["id"], now_dt)
+            fired_any = True
+    if fired_any:
+        save_reminders(df)
+    # 1분 후 자동 새로고침 (앱이 켜져있는 동안에만 작동)
+    st.markdown("<script>setTimeout(() => window.location.reload(), 60*1000);</script>", unsafe_allow_html=True)
+
+
+# -------------------------
 # 사이드바
-# =========================
+# -------------------------
 st.sidebar.markdown("## 📂 페이지 이동")
-PAGE_TRACKER = "자기계발 시간 트래커"
+PAGE_TRACKER  = "자기계발 시간 트래커"
 PAGE_REMINDER = "일정 리마인더"
 page = st.sidebar.radio("이동", [PAGE_TRACKER, PAGE_REMINDER], index=0)
 
-# (트래커에서만) 목표 설정 표시
+# (트래커에서만) 목표 설정
 if page == PAGE_TRACKER:
     st.sidebar.header("🎯 목표 설정 (시간 단위)")
     goals = load_goals()
-
     t1, t2 = st.sidebar.tabs(["주간 목표(시간)", "월간 목표(시간)"])
+
     with t1:
         weekly_hours = {}
         for c in sorted(load_categories()):
@@ -332,7 +491,7 @@ if page == PAGE_TRACKER:
             monthly_hours[c] = st.number_input(f"{c}", min_value=0.0, step=0.5, value=cur_hr, key=f"goal_m_{c}")
         if st.button("월간 목표 저장"):
             for c, hr in monthly_hours.items():
-                goals["monthly"][c] = int(hr * 60)  # 내부 저장은 분
+                goals["monthly"][c] = int(hr * 60)
             save_goals(goals)
             st.sidebar.success("월간 목표 저장 완료")
 
@@ -370,9 +529,10 @@ if os.path.exists(REMINDERS_CSV):
     with open(REMINDERS_CSV, "rb") as f:
         st.sidebar.download_button("리마인더 CSV 내보내기", f, file_name="reminders.csv")
 
-# =========================
+
+# -------------------------
 # 라우팅
-# =========================
+# -------------------------
 if page == PAGE_TRACKER:
     render_tracker_page()
 else:
