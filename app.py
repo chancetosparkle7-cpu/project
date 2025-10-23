@@ -281,7 +281,7 @@ def send_slack(title: str, body: str) -> bool:
 st.set_page_config(page_title="자기계발 트래커 + 리마인더", page_icon="⏱️", layout="wide")
 
 # 1분마다 자동 새로고침(열려 있는 동안 리마인더 감지)
-st_autorefresh = st.experimental_rerun  # 안전장치용 별칭
+st_autorefresh = st.rerun  # Streamlit 최신 버전 대응
 st.experimental_set_query_params()      # (빈 호출로 초기화)
 st_autorefresh_token = st.experimental_data_editor if False else None  # no-op, 키 충돌 방지용
 
@@ -585,3 +585,4 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.caption("💡 리마인더는 **앱이 열려 있을 때** 1분 간격으로 감지/발송됩니다. Slack 웹훅을 설정하면 앱이 열려 있어도 Slack으로 알림을 받을 수 있습니다.")
+
