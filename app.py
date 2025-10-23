@@ -11,9 +11,8 @@ from calendar import monthrange
 
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
 
-# 페이지 설정 (한 번만 호출)
+# 페이지 설정
 st.set_page_config(page_title="자기계발 트래커 / 일정 리마인더", page_icon="⏱️", layout="wide")
 
 # Optional deps
@@ -28,7 +27,7 @@ try:
 except Exception:
     SupabaseClient = None
 
-# (참고) 구글 캘린더 API는 화면 표시는 제거했지만 함수를 남겨둘 수 있어 import만 유지
+# (화면에서는 캘린더 표시 안 씀)
 try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
@@ -41,11 +40,14 @@ except Exception:
 # =============================
 APP_DIR = os.path.join(".", ".habit_tracker")
 TRACKS_CSV = os.path.join(APP_DIR, "tracks.csv")
-STATE_JSON = os.path.join(APP_DIR, "running.json")
+STATE_JSON  = os.path.join(APP_DIR, "running.json")         # running only (CSV 백엔드)
+GOALS_JSON  = os.path.join(APP_DIR, "goals.json")           # goals only (CSV 백엔드)
 CATEGORIES_JSON = os.path.join(APP_DIR, "categories.json")
-REMINDERS_CSV = os.path.join(APP_DIR, "reminders.csv")
+REMINDERS_CSV   = os.path.join(APP_DIR, "reminders.csv")
 
+DEFAULT_CATEGORIES = ["공보", "운동", "독서", "글쓰기", "외국어", "명상"]  # 오타? "공부" 가 맞음 -> 아래서 보정
 DEFAULT_CATEGORIES = ["공부", "운동", "독서", "글쓰기", "외국어", "명상"]
+
 EN2KR = {
     "study": "공부",
     "workout": "운동",
@@ -82,12 +84,6 @@ def parse_iso(s: str) -> datetime: return datetime.fromisoformat(s).astimezone(K
 def fmt_minutes(mins: int): h, m = mins // 60, mins % 60; return f"{h}h {m}m" if h else f"{m}m"
 
 def to_kst_series(s: pd.Series) -> pd.Series:
-    """
-    Datetime Series를 KST로 안전 변환.
-    - tz-naive: KST로 localize
-    - tz-aware: KST로 convert
-    - NaT/빈값은 그대로 유지
-    """
     s = pd.to_datetime(s, errors="coerce")
     if getattr(s.dtype, "tz", None) is None:
         return s.dt.tz_localize("Asia/Seoul", nonexistent="NaT", ambiguous="NaT")
@@ -108,14 +104,12 @@ def sqlite_conn():
 def sqlite_init():
     conn = sqlite_conn(); cur = conn.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS categories(name TEXT PRIMARY KEY)""")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS tracks(
+    cur.execute("""CREATE TABLE IF NOT EXISTS tracks(
             id TEXT PRIMARY KEY,
             start_iso TEXT, end_iso TEXT, minutes INTEGER,
             category TEXT, note TEXT
         )""")
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS reminders(
+    cur.execute("""CREATE TABLE IF NOT EXISTS reminders(
             id TEXT PRIMARY KEY,
             title TEXT, category TEXT, note TEXT,
             due_iso TEXT, advance_minutes INTEGER,
@@ -204,7 +198,7 @@ def migrate_categories_to_korean():
             )
 
 # =============================
-# 트래킹 데이터
+# 트래킹 데이터 + 편집/삭제
 # =============================
 def read_state():
     if use_supabase():
@@ -232,12 +226,36 @@ def write_state(data):
     with open(STATE_JSON, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def clear_state():
+def state_get(key: str, default=None):
+    # goals 등 K/V 저장용
     if use_supabase():
-        _supabase.table("state").delete().eq("key","running").execute(); return
+        data = _supabase.table("state").select("value").eq("key", key).limit(1).execute().data
+        return json.loads(data[0]["value"]) if data else default
     if use_sqlite():
-        conn = sqlite_init(); conn.execute("DELETE FROM state WHERE key='running'"); conn.commit(); return
-    if os.path.exists(STATE_JSON): os.remove(STATE_JSON)
+        conn = sqlite_init()
+        row = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+    # CSV 백엔드: 별도 goals.json 파일 사용
+    path = GOALS_JSON if key == "goals" else STATE_JSON
+    if not os.path.exists(path): return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def state_set(key: str, value):
+    if use_supabase():
+        _supabase.table("state").upsert({"key": key, "value": json.dumps(value, ensure_ascii=False)}).execute(); return
+    if use_sqlite():
+        conn = sqlite_init()
+        conn.execute("INSERT OR REPLACE INTO state(key,value) VALUES(?,?)",
+                     (key, json.dumps(value, ensure_ascii=False)))
+        conn.commit(); return
+    # CSV 백엔드: 별도 goals.json 파일 사용
+    path = GOALS_JSON if key == "goals" else STATE_JSON
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
 
 def append_track(start_dt, end_dt, category, note=""):
     minutes = int(round((end_dt - start_dt).total_seconds() / 60.0))
@@ -258,29 +276,93 @@ def append_track(start_dt, end_dt, category, note=""):
     return minutes
 
 def read_all_tracks_df() -> pd.DataFrame:
+    # 반환: 공통 컬럼 + row_id(수정/삭제용 식별자)
     if use_supabase():
-        data = _supabase.table("tracks").select("*").execute().data or []
+        data = _supabase.table("tracks").select("*").order("start_iso", desc=True).execute().data or []
         df = pd.DataFrame(data)
         if df.empty: return df
-        df["start_iso"] = pd.to_datetime(df["start_iso"]); df["end_iso"] = pd.to_datetime(df["end_iso"])
-        df["start"] = df["start_iso"]; df["end"] = df["end_iso"]
-        df["minutes"] = pd.to_numeric(df["minutes"], errors="coerce").fillna(0).astype(int)
-        df["category"] = df["category"].astype(str); return df
-    if use_sqlite():
-        conn = sqlite_init(); df = pd.read_sql_query("SELECT * FROM tracks", conn)
-        if df.empty: return df
+        df["row_id"] = df["id"].astype(str)
         df["start_iso"] = pd.to_datetime(df["start_iso"]); df["end_iso"] = pd.to_datetime(df["end_iso"])
         df["start"] = df["start_iso"]; df["end"] = df["end_iso"]
         df["minutes"] = pd.to_numeric(df["minutes"], errors="coerce").fillna(0).astype(int)
         return df
+    if use_sqlite():
+        conn = sqlite_init()
+        df = pd.read_sql_query("SELECT * FROM tracks ORDER BY start_iso DESC", conn)
+        if df.empty: return df
+        df["row_id"] = df["id"].astype(str)
+        df["start_iso"] = pd.to_datetime(df["start_iso"]); df["end_iso"] = pd.to_datetime(df["end_iso"])
+        df["start"] = df["start_iso"]; df["end"] = df["end_iso"]
+        df["minutes"] = pd.to_numeric(df["minutes"], errors="coerce").fillna(0).astype(int)
+        return df
+    # CSV
     df = pd.read_csv(TRACKS_CSV, encoding="utf-8")
     if df.empty: return df
-    df["start"] = pd.to_datetime(df["start_iso"]); df["end"] = pd.to_datetime(df["end_iso"])
+    df["row_id"] = df.index.astype(str)  # 파일 내 행 인덱스
+    df["start_iso"] = pd.to_datetime(df["start_iso"]); df["end_iso"] = pd.to_datetime(df["end_iso"])
+    df["start"] = df["start_iso"]; df["end"] = df["end_iso"]
     df["minutes"] = pd.to_numeric(df["minutes"], errors="coerce").fillna(0).astype(int)
+    df = df.sort_values("start", ascending=False)
     return df
 
+def delete_tracks(row_ids: list[str]) -> int:
+    if not row_ids: return 0
+    if use_supabase():
+        for rid in row_ids:
+            _supabase.table("tracks").delete().eq("id", rid).execute()
+        return len(row_ids)
+    if use_sqlite():
+        conn = sqlite_init()
+        cur = conn.cursor()
+        cur.executemany("DELETE FROM tracks WHERE id=?", [(rid,) for rid in row_ids])
+        conn.commit(); return len(row_ids)
+    # CSV
+    df = pd.read_csv(TRACKS_CSV, encoding="utf-8")
+    df["__idx"] = df.index.astype(str)
+    keep = ~df["__idx"].isin(row_ids)
+    kept = df[keep].drop(columns="__idx")
+    kept.to_csv(TRACKS_CSV, index=False, encoding="utf-8")
+    return int((~keep).sum())
+
+def update_track(row_id: str, new_category: str, new_minutes: int, new_note: str) -> bool:
+    # end_iso = start_iso + minutes 로 재계산
+    if use_supabase():
+        row = _supabase.table("tracks").select("start_iso").eq("id", row_id).limit(1).execute().data
+        if not row: return False
+        start_dt = pd.to_datetime(row[0]["start_iso"]).to_pydatetime().astimezone(KST)
+        end_dt = start_dt + timedelta(minutes=int(new_minutes))
+        _supabase.table("tracks").update({
+            "category": new_category, "minutes": int(new_minutes),
+            "note": new_note, "end_iso": iso(end_dt)
+        }).eq("id", row_id).execute()
+        return True
+    if use_sqlite():
+        conn = sqlite_init()
+        row = conn.execute("SELECT start_iso FROM tracks WHERE id=?", (row_id,)).fetchone()
+        if not row: return False
+        start_dt = datetime.fromisoformat(row[0]).astimezone(KST)
+        end_dt = start_dt + timedelta(minutes=int(new_minutes))
+        conn.execute("""UPDATE tracks
+                        SET category=?, minutes=?, note=?, end_iso=?
+                        WHERE id=?""",
+                     (new_category, int(new_minutes), new_note, iso(end_dt), row_id))
+        conn.commit(); return True
+    # CSV
+    df = pd.read_csv(TRACKS_CSV, encoding="utf-8")
+    df["__idx"] = df.index.astype(str)
+    if row_id not in set(df["__idx"]): return False
+    i = df.index[df["__idx"] == row_id][0]
+    start_dt = datetime.fromisoformat(df.at[i, "start_iso"]).astimezone(KST)
+    end_dt = start_dt + timedelta(minutes=int(new_minutes))
+    df.at[i, "category"] = new_category
+    df.at[i, "minutes"]  = int(new_minutes)
+    df.at[i, "note"]     = new_note
+    df.at[i, "end_iso"]  = iso(end_dt)
+    df.drop(columns="__idx").to_csv(TRACKS_CSV, index=False, encoding="utf-8")
+    return True
+
 # =============================
-# 리마인더
+# 리마인더 (변경 없음)
 # =============================
 REPEAT_CHOICES = ["없음", "매일", "매주", "매월"]
 
@@ -393,9 +475,20 @@ def send_slack(title: str, body: str) -> bool:
     except Exception:
         return False
 
-# (화면에서는 사용하지 않음)
-def fetch_calendar_events(start_dt: datetime, end_dt: datetime) -> list[dict]:
-    return []
+# =============================
+# 목표(주/월) 저장/불러오기
+# =============================
+def load_goals():
+    goals = state_get("goals", default={"weekly": {}, "monthly": {}})
+    # 카테고리 누락시 0으로 채움
+    cats = load_categories()
+    for c in cats:
+        goals["weekly"].setdefault(c, 0)
+        goals["monthly"].setdefault(c, 0)
+    return goals
+
+def save_goals(goals: dict):
+    state_set("goals", goals)
 
 # =============================
 # 공통 함수(기간, 요약)
@@ -432,11 +525,11 @@ def summarize(df: pd.DataFrame, start: datetime, end: datetime):
     return by_cat, total
 
 # =============================
-# 페이지
+# 페이지: 트래커
 # =============================
 def render_tracker_page():
     st.title("⏱️ 자기계발 시간 트래커")
-    st.caption("KST 기준 · CSV/SQLite/Supabase 영속 · 타이머/수동기록 · 요약/차트")
+    st.caption("KST 기준 · CSV/SQLite/Supabase 영속 · 타이머/수동기록 · 최근 기록/요약 2분할 + 필터/편집/삭제 + 목표 게이지")
 
     if "running" not in st.session_state: st.session_state.running = read_state()
 
@@ -458,7 +551,8 @@ def render_tracker_page():
                 if st.button("🛑 세션 종료/기록"):
                     try:
                         minutes = append_track(start_dt, now(), cat, stop_note)
-                        clear_state(); st.session_state.running = None
+                        write_state(None)  # 호환
+                        st.session_state.running = None
                         st.success(f"세션 종료: [{cat}] {minutes}분 기록")
                     except Exception as e:
                         st.error(f"기록 실패: {e}")
@@ -489,154 +583,137 @@ def render_tracker_page():
 
     st.divider()
 
-    # --- 요약 & 차트: 2단 (원형/막대 + 일별 누적/그룹형)
-    df = read_all_tracks_df()
-    st.subheader("📊 요약 & 📈 차트")
-    period = st.selectbox("기간", ["오늘", "어제", "이번 주", "이번 달", "전체"], index=0, key="sum_period")
+    # --- 최근 기록 & 요약 (필터 + 편집/삭제 + 목표 게이지)
+    df_all = read_all_tracks_df()
+    st.subheader("🧭 최근 기록 & 🧾 요약")
+
+    # 1) 요약 기간 & 집계 단위
+    colA, colB, colC = st.columns([1.1, 1, 1])
+    with colA:
+        period = st.selectbox("요약 기간", ["오늘", "어제", "이번 주", "이번 달", "전체"], index=0, key="sum_period")
+    with colB:
+        agg_unit = st.selectbox("집계 단위(목표 비교)", ["주", "월"], index=0, key="agg_unit")
+    with colC:
+        page_size = st.selectbox("표시 개수", [20, 50, 100, 200], index=1)
+
     start, end = daterange_start_end(period)
 
-    left, right = st.columns([1, 1], gap="large")
+    # 2) 최근 기록 필터바
+    st.markdown("##### 🔎 최근 기록 필터")
+    cats = load_categories()
+    fcol1, fcol2, fcol3 = st.columns([1, 2, 1])
+    with fcol1:
+        cat_filter = st.multiselect("카테고리", options=sorted(cats), default=[])
+    with fcol2:
+        memo_filter = st.text_input("메모 포함 검색", key="memo_filter")
+    with fcol3:
+        date_from = st.date_input("시작일(옵션)", value=None, key="f_date_from")
+        date_to   = st.date_input("종료일(옵션)", value=None, key="f_date_to")
 
-    # ---------- 요약 ----------
+    df = df_all.copy()
+    if not df.empty:
+        # 기간 기본 필터(요약 기간)
+        df = df[(df["start"] >= pd.to_datetime(start.isoformat())) & (df["end"] <= pd.to_datetime(end.isoformat()))]
+        # 추가 날짜 필터
+        if date_from:
+            df = df[df["start"] >= pd.to_datetime(datetime.combine(date_from, datetime.min.time(), tzinfo=KST).isoformat())]
+        if date_to:
+            df = df[df["end"] <= pd.to_datetime(datetime.combine(date_to, datetime.max.time(), tzinfo=KST).isoformat())]
+        # 카테고리
+        if cat_filter:
+            df = df[df["category"].isin(cat_filter)]
+        # 메모
+        if memo_filter.strip():
+            df = df[df["note"].astype(str).str.contains(memo_filter, case=False, na=False)]
+
+    left, right = st.columns([1.4, 1.0], gap="large")
+
+    # 왼쪽: 최근 기록 + 편집/삭제
     with left:
-        st.markdown("#### 요약")
+        st.markdown("#### 📜 최근 기록")
         if df.empty:
-            st.info("아직 기록이 없습니다.")
-            sum_df = pd.DataFrame(columns=["category", "minutes", "formatted"])
+            st.info("기록이 없습니다.")
         else:
-            by_cat, total = summarize(df, start, end)
+            df_view = df.copy().sort_values("start", ascending=False).head(page_size)
+            df_view["시작(KST)"] = pd.to_datetime(df_view["start_iso"]).dt.tz_convert("Asia/Seoul")
+            df_view["종료(KST)"] = pd.to_datetime(df_view["end_iso"]).dt.tz_convert("Asia/Seoul")
+            df_view = df_view[["row_id","category","시작(KST)","종료(KST)","minutes","note"]]
+            df_view = df_view.rename(columns={
+                "row_id":"ID","category":"카테고리","minutes":"분","note":"메모"
+            })
+            st.dataframe(df_view, use_container_width=True, hide_index=True)
+
+            # 선택 & 편집/삭제 UI
+            st.markdown("##### ✏️ 편집 / 🗑 삭제")
+            # 선택 목록 라벨: [카테고리] YYYY-MM-DD HH:MM (분)
+            options = []
+            for _, r in df_view.iterrows():
+                label = f"[{r['카테고리']}] {str(r['시작(KST)'])[:16]} · {int(r['분'])}분"
+                options.append((label, r["ID"]))
+            labels = [o[0] for o in options]; values = [o[1] for o in options]
+            sel_ids = st.multiselect("선택(여러 개 가능)", options=values, format_func=lambda v: labels[values.index(v)] if v in values else v)
+
+            e1, e2 = st.columns([1,1])
+            with e1:
+                if st.button("🗑 선택 삭제"):
+                    if sel_ids:
+                        n = delete_tracks(sel_ids)
+                        st.success(f"{n}건 삭제 완료"); st.experimental_rerun()
+                    else:
+                        st.info("선택 항목이 없습니다.")
+            with e2:
+                st.write("")  # spacing
+            # 단일 편집 폼
+            if len(sel_ids) == 1:
+                rid = sel_ids[0]
+                row = df_view[df_view["ID"] == rid].iloc[0]
+                with st.form("edit_form"):
+                    new_cat = st.selectbox("카테고리", options=sorted(load_categories()), index=sorted(load_categories()).index(row["카테고리"]) if row["카테고리"] in load_categories() else 0)
+                    new_min = st.number_input("분(1 이상)", min_value=1, step=5, value=int(row["분"]))
+                    new_note = st.text_input("메모", value=row["메모"] or "")
+                    submitted = st.form_submit_button("💾 저장")
+                    if submitted:
+                        ok = update_track(rid, new_cat, int(new_min), new_note)
+                        if ok: st.success("수정 완료"); st.experimental_rerun()
+                        else:  st.error("수정 실패(식별자 오류)")
+
+    # 오른쪽: 요약 + 목표 게이지
+    with right:
+        st.markdown("#### 🧾 요약(카테고리별 합계)")
+        if df_all.empty:
+            st.info("기록이 없습니다.")
+        else:
+            by_cat, total = summarize(df_all, start, end)
             st.caption(f"{start.date()} ~ {(end - timedelta(seconds=1)).date()}")
             if total == 0:
                 st.write("해당 기간 기록이 없습니다.")
-                sum_df = pd.DataFrame(columns=["category", "minutes", "formatted"])
             else:
                 sum_df = (
-                    pd.DataFrame([{"category": k, "minutes": v} for k, v in by_cat.items()])
-                    .sort_values("minutes", ascending=False)
+                    pd.DataFrame([{"카테고리": k, "분": v} for k, v in by_cat.items()])
+                    .sort_values("분", ascending=False)
                     .reset_index(drop=True)
                 )
-                sum_df["formatted"] = sum_df["minutes"].apply(lambda m: fmt_minutes(int(m)))
+                sum_df["표시"] = sum_df["분"].apply(lambda m: fmt_minutes(int(m)))
                 st.dataframe(sum_df, use_container_width=True, hide_index=True)
                 st.markdown(f"**합계: {fmt_minutes(total)} ({total}분)**")
 
-    # ---------- 차트 ----------
-    with right:
-        st.markdown("#### 차트")
+                # 목표 대비 진행률(게이지)
+                st.markdown("##### 🎯 목표 대비 진행률")
+                goals = load_goals()
+                goal_map = goals["weekly"] if agg_unit == "주" else goals["monthly"]
 
-        if df.empty or sum_df.empty:
-            st.info("차트를 표시할 데이터가 없습니다.")
-        else:
-            # 기간 내로 클립된 데이터(분) 계산
-            s, e = pd.to_datetime(start.isoformat()), pd.to_datetime(end.isoformat())
-            clip_df = df.copy()
-            clip_df["overlap_start"] = clip_df["start"].clip(lower=s)
-            clip_df["overlap_end"] = clip_df["end"].clip(upper=e)
-            clip_df["minutes_clip"] = (
-                (clip_df["overlap_end"] - clip_df["overlap_start"]).dt.total_seconds() / 60
-            ).clip(lower=0).round().astype(int)
-            clip_df["date"] = (
-                pd.to_datetime(clip_df["overlap_start"]).dt.tz_convert("Asia/Seoul").dt.date
-            )
+                for _, r in sum_df.iterrows():
+                    cat = r["카테고리"]; val = int(r["분"])
+                    target = int(goal_map.get(cat, 0) or 0)
+                    pct = 1.0 if target <= 0 else min(1.0, val / target)
+                    st.write(f"- {cat}: {val}분 / 목표 {target}분")
+                    st.progress(pct, text=f"{int(pct*100)}%")
 
-            # 1) 차트 유형
-            chart_type = st.radio(
-                "차트 유형",
-                ["원형(비중)", "막대(합계)", "일별 막대(전체/선택)"],
-                index=0,
-                horizontal=True,
-                key="chart_type_selector",
-            )
+                st.caption("※ 목표는 사이드바의 ‘🎯 목표 설정’에서 저장하세요. (주/월 단위)")
 
-            # ----- 1-a) 원형(비중)
-            if chart_type == "원형(비중)":
-                fig1, ax1 = plt.subplots()
-                ax1.pie(sum_df["minutes"], labels=sum_df["category"], autopct="%1.0f%%")
-                ax1.set_title(f"{period} 카테고리 비중")
-                st.pyplot(fig1)
-
-            # ----- 1-b) 막대(합계)
-            elif chart_type == "막대(합계)":
-                fig2, ax2 = plt.subplots()
-                ax2.bar(sum_df["category"], sum_df["minutes"])
-                ax2.set_xlabel("카테고리"); ax2.set_ylabel("분"); ax2.set_title(f"{period} 카테고리별 합계(분)")
-                plt.xticks(rotation=0)
-                st.pyplot(fig2)
-
-            # ----- 1-c) 일별 막대(전체/선택) : 누적/그룹형 옵션
-            else:
-                st.divider()
-                st.markdown("##### 일별 막대 옵션")
-
-                cat_pick = st.radio(
-                    "대상",
-                    options=["(전체)"] + sum_df["category"].tolist(),
-                    horizontal=True,
-                    key="bar_cat_pick",
-                )
-
-                bar_mode = st.radio(
-                    "막대 모드",
-                    options=["누적", "그룹형"],
-                    horizontal=True,
-                    key="bar_mode_selector",
-                )
-
-                cat_daily = clip_df.groupby(["date", "category"])["minutes_clip"].sum().reset_index()
-                pivot = cat_daily.pivot(index="date", columns="category", values="minutes_clip").fillna(0)
-
-                if cat_pick == "(전체)":
-                    if pivot.empty:
-                        st.info("표시할 데이터가 없습니다.")
-                    else:
-                        if bar_mode == "누적":
-                            fig3, ax3 = plt.subplots()
-                            pivot.plot(kind="bar", stacked=True, ax=ax3)
-                            ax3.set_xlabel("날짜"); ax3.set_ylabel("분")
-                            ax3.set_title(f"{period} 일별 누적 막대(전체)")
-                            plt.xticks(rotation=45, ha="right")
-                            st.pyplot(fig3)
-                        else:
-                            fig4, ax4 = plt.subplots()
-                            dates = pivot.index.astype(str).tolist()
-                            cats = pivot.columns.tolist()
-                            x = range(len(dates))
-                            width = 0.8 / max(1, len(cats))
-                            for i, c in enumerate(cats):
-                                ax4.bar(
-                                    [xi + (i - (len(cats)-1)/2)*width for xi in x],
-                                    pivot[c].values,
-                                    width=width,
-                                    label=c,
-                                )
-                            ax4.set_xticks(list(x), dates, rotation=45, ha="right")
-                            ax4.set_xlabel("날짜"); ax4.set_ylabel("분")
-                            ax4.set_title(f"{period} 일별 그룹형 막대(전체)")
-                            ax4.legend(ncol=min(4, len(cats)))
-                            st.pyplot(fig4)
-                else:
-                    sub = pivot[[cat_pick]] if cat_pick in pivot.columns else pd.DataFrame(index=pivot.index)
-                    sub = sub.rename(columns={cat_pick: "minutes"}).fillna(0)
-                    if sub.empty:
-                        st.info("표시할 데이터가 없습니다.")
-                    else:
-                        fig5, ax5 = plt.subplots()
-                        ax5.bar(sub.index.astype(str), sub["minutes"].values)
-                        ax5.set_xlabel("날짜"); ax5.set_ylabel("분")
-                        ax5.set_title(f"{period} [{cat_pick}] 일별 합계(분)")
-                        plt.xticks(rotation=45, ha="right")
-                        st.pyplot(fig5)
-
-    st.divider()
-
-    # --- 최근 로그
-    st.subheader("📜 최근 기록")
-    if df.empty:
-        st.info("기록이 없습니다.")
-    else:
-        df_view = df.copy().sort_values("start", ascending=False)
-        df_view = df_view[["category","start_iso","end_iso","minutes","note"]]
-        st.dataframe(df_view, use_container_width=True)
-
+# =============================
+# 페이지: 리마인더
+# =============================
 def render_reminder_page():
     st.title("🔔 일정 리마인더")
     st.caption("사전 알림 · 반복 · Slack 연동")
@@ -683,10 +760,14 @@ def render_reminder_page():
             "id","active","title","category","note",
             "due_local","advance_minutes","repeat","last_fired_local"
         ]].sort_values(["active","due_local"], ascending=[False, True])
+        view = view.rename(columns={
+            "id":"ID","active":"활성","title":"제목","category":"카테고리","note":"메모",
+            "due_local":"기한(KST)","advance_minutes":"사전알림(분)","repeat":"반복","last_fired_local":"마지막 발송(KST)"
+        })
         st.dataframe(view, use_container_width=True, hide_index=True)
 
         st.markdown("#### 선택 항목 관리")
-        sel = st.multiselect("리마인더 선택(ID)", options=view["id"].tolist(), key="rem_select")
+        sel = st.multiselect("리마인더 선택(ID)", options=view["ID"].tolist(), key="rem_select")
         c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("선택 비활성화", key="rem_disable"):
@@ -716,7 +797,7 @@ def render_reminder_page():
                     save_reminders_df(rem_df); st.success(f"{fired}건 처리")
 
 # -----------------------------
-# 라우팅 & 사이드바
+# 사이드바: 네비 + 설정/데이터 + 목표 설정
 # -----------------------------
 st.sidebar.markdown("## 📂 페이지")
 PAGE_TRACKER = "자기계발 시간 트래커"
@@ -756,6 +837,23 @@ with st.sidebar:
     if os.path.exists(REMINDERS_CSV):
         with open(REMINDERS_CSV, "rb") as f:
             st.download_button("CSV 내보내기(리마인더)", f, file_name="reminders.csv", mime="text/csv")
+
+    st.divider()
+    st.header("🎯 목표 설정")
+    goals = load_goals()
+    t1, t2 = st.tabs(["주간 목표(분)", "월간 목표(분)"])
+    with t1:
+        new_weekly = {}
+        for c in sorted(load_categories()):
+            new_weekly[c] = st.number_input(f"{c}", min_value=0, step=10, value=int(goals["weekly"].get(c, 0) or 0), key=f"goal_w_{c}")
+        if st.button("주간 목표 저장"):
+            goals["weekly"] = new_weekly; save_goals(goals); st.success("주간 목표 저장 완료")
+    with t2:
+        new_monthly = {}
+        for c in sorted(load_categories()):
+            new_monthly[c] = st.number_input(f"{c}", min_value=0, step=10, value=int(goals["monthly"].get(c, 0) or 0), key=f"goal_m_{c}")
+        if st.button("월간 목표 저장"):
+            goals["monthly"] = new_monthly; save_goals(goals); st.success("월간 목표 저장 완료")
 
 # 라우팅
 if page == PAGE_TRACKER:
