@@ -45,7 +45,6 @@ GOALS_JSON  = os.path.join(APP_DIR, "goals.json")           # goals only (CSV �
 CATEGORIES_JSON = os.path.join(APP_DIR, "categories.json")
 REMINDERS_CSV   = os.path.join(APP_DIR, "reminders.csv")
 
-DEFAULT_CATEGORIES = ["공보", "운동", "독서", "글쓰기", "외국어", "명상"]  # 오타? "공부" 가 맞음 -> 아래서 보정
 DEFAULT_CATEGORIES = ["공부", "운동", "독서", "글쓰기", "외국어", "명상"]
 
 EN2KR = {
@@ -362,7 +361,7 @@ def update_track(row_id: str, new_category: str, new_minutes: int, new_note: str
     return True
 
 # =============================
-# 리마인더 (변경 없음)
+# 리마인더
 # =============================
 REPEAT_CHOICES = ["없음", "매일", "매주", "매월"]
 
@@ -480,7 +479,6 @@ def send_slack(title: str, body: str) -> bool:
 # =============================
 def load_goals():
     goals = state_get("goals", default={"weekly": {}, "monthly": {}})
-    # 카테고리 누락시 0으로 채움
     cats = load_categories()
     for c in cats:
         goals["weekly"].setdefault(c, 0)
@@ -551,7 +549,7 @@ def render_tracker_page():
                 if st.button("🛑 세션 종료/기록"):
                     try:
                         minutes = append_track(start_dt, now(), cat, stop_note)
-                        write_state(None)  # 호환
+                        write_state(None)
                         st.session_state.running = None
                         st.success(f"세션 종료: [{cat}] {minutes}분 기록")
                     except Exception as e:
@@ -645,7 +643,6 @@ def render_tracker_page():
 
             # 선택 & 편집/삭제 UI
             st.markdown("##### ✏️ 편집 / 🗑 삭제")
-            # 선택 목록 라벨: [카테고리] YYYY-MM-DD HH:MM (분)
             options = []
             for _, r in df_view.iterrows():
                 label = f"[{r['카테고리']}] {str(r['시작(KST)'])[:16]} · {int(r['분'])}분"
@@ -662,7 +659,7 @@ def render_tracker_page():
                     else:
                         st.info("선택 항목이 없습니다.")
             with e2:
-                st.write("")  # spacing
+                pass
             # 단일 편집 폼
             if len(sel_ids) == 1:
                 rid = sel_ids[0]
@@ -797,13 +794,33 @@ def render_reminder_page():
                     save_reminders_df(rem_df); st.success(f"{fired}건 처리")
 
 # -----------------------------
-# 사이드바: 네비 + 설정/데이터 + 목표 설정
+# 사이드바: 네비 + (위) 목표 설정 → (아래) 설정/데이터 & 백업
 # -----------------------------
 st.sidebar.markdown("## 📂 페이지")
 PAGE_TRACKER = "자기계발 시간 트래커"
 PAGE_REMINDER = "일정 리마인더"
 page = st.sidebar.radio("이동", [PAGE_TRACKER, PAGE_REMINDER], index=0, key="nav_page")
 
+# --- 목표 설정 (상단)
+st.sidebar.header("🎯 목표 설정")
+goals = load_goals()
+t1, t2 = st.sidebar.tabs(["주간 목표(분)", "월간 목표(분)"])
+with t1:
+    new_weekly = {}
+    for c in sorted(load_categories()):
+        new_weekly[c] = st.number_input(f"{c}", min_value=0, step=10, value=int(goals["weekly"].get(c, 0) or 0), key=f"goal_w_{c}")
+    if st.button("주간 목표 저장"):
+        goals["weekly"] = new_weekly; save_goals(goals); st.sidebar.success("주간 목표 저장 완료")
+with t2:
+    new_monthly = {}
+    for c in sorted(load_categories()):
+        new_monthly[c] = st.number_input(f"{c}", min_value=0, step=10, value=int(goals["monthly"].get(c, 0) or 0), key=f"goal_m_{c}")
+    if st.button("월간 목표 저장"):
+        goals["monthly"] = new_monthly; save_goals(goals); st.sidebar.success("월간 목표 저장 완료")
+
+st.sidebar.divider()
+
+# --- 설정/데이터 & 데이터 백업 (하단)
 st.sidebar.title("⚙️ 설정 / 데이터")
 st.sidebar.caption(f"저장소: **{BACKEND.upper()}**")
 
@@ -830,30 +847,13 @@ with st.sidebar:
         migrate_categories_to_korean(); st.success("카테고리/기록을 한글로 변환했습니다!")
 
     st.divider()
-    st.header("데이터 백업 (CSV)")
+    st.header("📦 데이터 백업 (CSV)")
     if os.path.exists(TRACKS_CSV):
         with open(TRACKS_CSV, "rb") as f:
             st.download_button("CSV 내보내기(트래킹)", f, file_name="tracks.csv", mime="text/csv")
     if os.path.exists(REMINDERS_CSV):
         with open(REMINDERS_CSV, "rb") as f:
             st.download_button("CSV 내보내기(리마인더)", f, file_name="reminders.csv", mime="text/csv")
-
-    st.divider()
-    st.header("🎯 목표 설정")
-    goals = load_goals()
-    t1, t2 = st.tabs(["주간 목표(분)", "월간 목표(분)"])
-    with t1:
-        new_weekly = {}
-        for c in sorted(load_categories()):
-            new_weekly[c] = st.number_input(f"{c}", min_value=0, step=10, value=int(goals["weekly"].get(c, 0) or 0), key=f"goal_w_{c}")
-        if st.button("주간 목표 저장"):
-            goals["weekly"] = new_weekly; save_goals(goals); st.success("주간 목표 저장 완료")
-    with t2:
-        new_monthly = {}
-        for c in sorted(load_categories()):
-            new_monthly[c] = st.number_input(f"{c}", min_value=0, step=10, value=int(goals["monthly"].get(c, 0) or 0), key=f"goal_m_{c}")
-        if st.button("월간 목표 저장"):
-            goals["monthly"] = new_monthly; save_goals(goals); st.success("월간 목표 저장 완료")
 
 # 라우팅
 if page == PAGE_TRACKER:
